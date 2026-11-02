@@ -2722,7 +2722,7 @@ class IpmxSdpTest(GenericTest):
                             if sdp.primary_media.ts_ref_clock_source != "localmac":
                                 return test.FAIL("Sender {} SDP media clock source {} do not match Node clock {}"
                                                  .format(sender["id"],
-                                                         sdp.primary_media.sdp.primary_media.ts_ref_clock_source,
+                                                         sdp.primary_media.ts_ref_clock_source,
                                                          clock))
 
                 if not clock_found:
