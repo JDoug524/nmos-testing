@@ -38,6 +38,8 @@ If testing a Sender
 
 A DuT may be tested against a video Profile and an audio Profile simultaneously or in sequence. In this document we use as an example the testing of a device against both a video Profile (uncompressed or JPEG XS) and an audio Profile (PCM or AM824). As such the `ipmx-test-senders.guid` file contains the GUID of the video Sender of the DuT and the GUID of the audio Sender of the DuT. The `ipmx-test-receivers.guid` file contains the GUID of the video Receiver of the DuT and the GUID of the audio Receiver of the DuT.
 
+When the DuT supports USB, the USB tests use GUID files that list only the USB Senders and USB Receivers of the DuT, and all the other tests use GUID files that list only its video and audio Senders and Receivers. Use a separate vendor setup for the USB tests: next to `IPMX-SETUP-XYZ.bat`, which sets `IPMX_VENDOR` to `XYZ` and uses the `IPMX_VENDOR_XYZ\` directory, create `IPMX-SETUP-XYZ-usb.bat`, which sets `IPMX_VENDOR` to `XYZ-usb` and uses the `IPMX_VENDOR_XYZ-usb\` directory for the USB GUID files and results. The USB role of a device is usually the reverse of its media role: a device that sends video and audio usually receives USB, and a device that receives video and audio usually sends USB. The Sender and Receiver addresses of the USB vendor setup are then swapped compared to the media vendor setup.
+
 Once selected, the GUIDs of the Senders and Receivers of the DuT cannot be changed as they are required to be persisted during the whole test sequence. When the same DuT is tested both as a Sender and as a Receiver role in sequence (not simultaneously), the GUID of a role can be captured when the testing of such role starts and then cannot be changed.
 
 ## Test Execution Workflow
@@ -582,6 +584,7 @@ These tests verify that your Device Under Test (DuT) correctly implements the NM
     ```
     - Results are sorted with FAILED tests printed last
     - Review output for any failures (some may be expected per test plan)
+    - If test_06 returns "Could Not Test" with the message "testing ECDH private/public keys pair regeneration require inactive senders", deactivate the Senders (master_enable set to false) and run the test suite again, this time only considering the results of test_06.
     - Assess that the Senders are transmitting to reference Receivers without disruptions.
 
     - If PEP is not supported along with HKEP disable the HKEP feature.
@@ -593,6 +596,7 @@ These tests verify that your Device Under Test (DuT) correctly implements the NM
     ```
     - Results are sorted with FAILED tests printed last
     - Review output for any failures (some may be expected per test plan)
+    - If test_07 returns "Could Not Test" with the message "testing ECDH private/public keys pair regeneration require inactive receivers", deactivate the Receivers (master_enable set to false) and run the test suite again, this time only considering the results of test_07.
     - Assess that the Receivers are receiving from reference Senders without disruptions.
 
     #### PEP as a Profile Capability
@@ -615,6 +619,120 @@ These tests verify that your Device Under Test (DuT) correctly implements the NM
     - The DuT Receiver shall not accept to receive the non-encrypted media stream from the RS2 reference Sender.
 
     - The DuT Receiver shall receive the privacy encrypted media stream from the RS1 reference Sender.
+
+11. **USB Capability Tests**
+
+    These tests follow TP-1 section 21.3. For IPMX certification the USB streams must be privacy encrypted with PEP: the non-encrypted mode described in TR-10-14 is not allowed.
+
+    #### Setup
+
+    - A USB Sender of the DuT has a keyboard and a mouse connected to two of its USB ports. It is connected to a reference USB Receiver, itself connected to a USB port of a host computer.
+    - A USB Receiver of the DuT is connected to a USB port of a host computer, to which it provides the keyboard and mouse. It is connected to a reference USB Sender that has a keyboard and a mouse connected to two of its USB ports.
+    - The DuT is configured with the 128 bit PSK `000102030405060708090a0b0c0d0e0f` and the key_id `0001020304050607`. A USB Sender of the DuT privacy encrypts its USB streams and a USB Receiver of the DuT privacy decrypts them. The reference USB Sender and Receiver are configured the same way.
+    - Run the USB vendor setup (see "GUID Configuration"): its GUID files list only the USB Senders and USB Receivers of the DuT.
+    - The DuT remains connected to its reference peer throughout the testing, unless a test calls for a disconnect and reconnect. The Vendor does not disconnect and reconnect the keyboard and mouse of a DuT Sender, or the host computer of a DuT Receiver, during the test.
+
+    #### BCP-007-02
+
+    - Activate the USB Senders of the DuT and connect a reference USB Receiver to them.
+
+    - Test the Senders of the DuT:
+    ```batch
+    BCP-007-02s.bat
+    ```
+    - Results are sorted with FAILED tests printed last
+    - Review output for any failures (some may be expected per test plan)
+    - Assess that the keyboard and mouse connected to the DuT Sender play back properly, as generated, on the host computer connected to the reference Receiver.
+
+    - Activate a reference USB Sender and connect the USB Receivers of the DuT to it.
+
+    - Test the Receivers of the DuT:
+    ```batch
+    BCP-007-02r.bat
+    ```
+    - Results are sorted with FAILED tests printed last
+    - Review output for any failures (some may be expected per test plan)
+    - Assess that the keyboard and mouse connected to the reference Sender play back properly, as generated, on the host computer connected to the DuT Receiver.
+
+    #### BCP-005-03
+
+    - With the USB Senders of the DuT connected to a reference USB Receiver, test the Senders of the DuT:
+    ```batch
+    BCP-005-03s.bat
+    ```
+    - Results are sorted with FAILED tests printed last
+    - Review output for any failures (some may be expected per test plan)
+    - If test_06 returns "Could Not Test" with the message "testing ECDH private/public keys pair regeneration require inactive senders", deactivate the Senders (master_enable set to false) and run the test suite again, this time only considering the results of test_06.
+    - Assess that the keyboard and mouse connected to the DuT Sender play back properly, as generated, on the host computer connected to the reference Receiver. If the test_06 re-run deactivated the Senders, activate them and reconnect the reference Receiver first.
+
+    - With a reference USB Sender connected to the USB Receivers of the DuT, test the Receivers of the DuT:
+    ```batch
+    BCP-005-03r.bat
+    ```
+    - Results are sorted with FAILED tests printed last
+    - Review output for any failures (some may be expected per test plan)
+    - If test_07 returns "Could Not Test" with the message "testing ECDH private/public keys pair regeneration require inactive receivers", deactivate the Receivers (master_enable set to false) and run the test suite again, this time only considering the results of test_07.
+    - Assess that the keyboard and mouse connected to the reference Sender play back properly, as generated, on the host computer connected to the DuT Receiver. If the test_07 re-run deactivated the Receivers, connect them to the reference Sender again first.
+
+    - BCP-005-03 only tests the Senders and Receivers that support privacy encryption. A USB Sender of the DuT must have the IS-04 `privacy` attribute set to `true`, and a USB Receiver of the DuT must expose the `ext_privacy_*` transport parameters. For a USB DuT, a "Not Implemented" result with "No BCP-005-03 (IPMX/PEP) Sender found" or "No BCP-005-03 (IPMX/PEP) Receiver found" is a failure.
+
+    #### SDP Transport File and Capabilities
+
+    These tests are those of TP-1 section 18.2.
+
+    - With the USB Senders of the DuT connected to a reference USB Receiver, test the Senders of the DuT:
+    ```batch
+    IPMX-SDPs-USB.bat
+    ```
+    - Results are sorted with FAILED tests printed last
+    - Review output for any failures (some may be expected per test plan)
+
+    - With a reference USB Sender connected to the USB Receivers of the DuT, test the Receivers of the DuT:
+    ```batch
+    IPMX-SDPr-USB.bat
+    ```
+    - Results are sorted with FAILED tests printed last
+    - Review output for any failures (some may be expected per test plan)
+    - This file is generated:
+        - `IPMX_VENDOR_XYZ-usb\data-<guid>.receiver.caps.json` - USB Receiver Capabilities file
+
+    #### USB protocol
+
+    The test is performed with a USB Sender of the DuT and a reference USB Receiver, or with a reference USB Sender and a USB Receiver of the DuT. Both the keyboard and the mouse are used, simultaneously.
+
+    - Connect the Receiver to the Sender and assess that the keyboard and mouse play back properly, as generated, on the host computer connected to the Receiver. Then disconnect the Receiver from the Sender.
+
+    - Capture a PCAP of the TCP exchange between the Sender and the Receiver:
+        - Start the capture, then connect the Receiver to the Sender.
+        - Use the keyboard and the mouse for at least 10 seconds, making sure they play back properly, as generated, on the host computer connected to the Receiver.
+        - Disconnect the Receiver from the Sender, keep capturing for at least 10 more seconds, then stop the capture.
+        - The USB exchange is unicast TCP between the Sender and the Receiver, so the capture point must see that traffic, for example a mirrored switch port. `IPMX-PCAPs.bat` captures multicast RTP streams and does not apply here.
+
+    - Save the SDP transport file of the Sender before the Sender is deactivated. A Sender may change the `iv` and `key_version` privacy parameters only across a deactivation and activation (TR-10-13), and the analysis needs the values used during the capture. For a USB Sender of the DuT:
+    ```batch
+    curl.exe -L -o IPMX_VENDOR_XYZ-usb\usb-<guid>.sdp http://%IPMX_SENDER_IS05_ADDRESS%:%IPMX_SENDER_IS05_PORT%/x-nmos/connection/v1.1/single/senders/<guid>/transportfile
+    ```
+    - For a reference Sender, use the IS-05 address, port and GUID of the reference Sender.
+
+    - Analyse the PCAP file:
+    ```batch
+    python ipmx\usb\ipmx-usb-tools\usbDissector.py --psk 000102030405060708090a0b0c0d0e0f --sdp IPMX_VENDOR_XYZ-usb\usb-<guid>.sdp -r IPMX_VENDOR_XYZ-usb\usb-<guid>.pcap
+    ```
+    - Always pass the `--psk` and `--sdp` options. The error "Error loading PEP parameters: No privacy descriptor found in SDP" means that the Sender does not declare privacy encryption: it is a failure, not a usage error. Do not remove the options to get past it.
+    - All the USB validations must PASS: the last line must read `Result: PASS`, and the line before it must report 0 error(s) and 0 warning(s) (`Total: N session(s), 0 error(s), 0 warning(s)`, possibly followed by a count of diag(s)). `Result: PASS` and the exit code 0 do not count warnings, so check both lines. A "Stream is not encrypted" warning is a failure.
+    - `Result: NOT TESTED` (exit code 2) means the PCAP file holds no IPMX USB message: the capture missed the exchange between the Sender and the Receiver. Capture again; it is not a pass.
+    - DIAG results are for the operator to judge and never count as failures. The `--diagnose` option adds such checks against core USB 2.0 rules that TR-10-14 does not mandate.
+    - The `-r` option prints the checklist of the requirements with their result.
+
+    #### Unplug and re-plug USB devices
+
+    The test is performed with a USB Sender of the DuT connected to a reference USB Receiver, or with a reference USB Sender connected to a USB Receiver of the DuT.
+
+    - With the keyboard and mouse connected to the Sender, confirm that the mouse movements and the keystrokes arrive at the host computer connected to the Receiver as generated.
+    - The operator unplugs both the keyboard and the mouse and keeps them unplugged for 5 seconds.
+    - The operator re-plugs the keyboard and the mouse.
+    - Wait until the host computer connected to the Receiver has enumerated the keyboard and the mouse again (it lists them again). Input made before that may never reach it.
+    - Confirm again that the mouse movements and the keystrokes arrive at the host computer connected to the Receiver as generated.
 
 ## Important Notes
 
