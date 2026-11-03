@@ -36,7 +36,7 @@ import statistics
 import struct
 import sys
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, IntEnum
 from pathlib import Path
 from typing import Optional
 
@@ -75,6 +75,13 @@ class Severity(str, Enum):
                          # a core USB 2.0 rule not met (--diagnose), which TR-10-14 does not mandate,
                          # or a message TR-10-14 requires but sets no time for, not sent by the time
                          # the observation of it ended (always reported)
+
+
+class Verdict(IntEnum):
+    """The capture's result; its value is the process exit code, as for ipmx_usb_tester.py."""
+    PASS       = 0
+    FAIL       = 1   # an ERROR: a requirement failed
+    NOT_TESTED = 2   # no IPMX USB message in the capture, so nothing was tested
 
 
 class Requirement(Enum):
@@ -417,6 +424,11 @@ class Session:
             requirement: Optional[Enum] = None) -> None:
         self.findings.append(Finding(severity, section, description, packet_number, detail,
                                      requirement=requirement))
+
+
+def _carries_usb(sess: Session) -> bool:
+    """True when *sess* holds at least one parsed IPMX USB message, on any of its channels."""
+    return bool(sess.control.messages) or any(ch.messages for ch in sess.data_connections)
 
 
 # ---------------------------------------------------------------------------
@@ -2282,6 +2294,9 @@ def analyze_pcap(
 
     With *diagnose*, each data channel is also checked against the core USB 2.0
     rules of :class:`Diagnostic`; breaches are DIAG findings, never errors.
+
+    A session's Sender port is read from its control connection. *sender_port* only labels
+    the session of data channels whose control connection is not in the capture.
     """
     _reset_framing_stats()
 
@@ -2313,19 +2328,6 @@ def analyze_pcap(
 
     if verbose:
         print(f"\nLoaded {len(packets)} packets from {pcap_file}")
-
-    # If no port specified try auto-detect (use the port with most SYN packets)
-    if sender_port is None:
-        port_counts: dict[int, int] = {}
-        for pkt in packets:
-            if pkt.haslayer(TCP):
-                tcp = pkt[TCP]
-                if tcp.flags.S and not tcp.flags.A:
-                    port_counts[tcp.dport] = port_counts.get(tcp.dport, 0) + 1
-        if port_counts:
-            sender_port = max(port_counts, key=port_counts.__getitem__)
-            if verbose:
-                print(f"  Auto-detected Sender port: {sender_port}")
 
     connections = _collect_streams(packets)
     lifecycles = _collect_lifecycles(packets)
@@ -2393,12 +2395,16 @@ def analyze_pcap(
 
     # Process control channels first to build sessions.
     for key, (ctype, sender_msgs, receiver_msgs) in _in_open_order('control'):
-        src_ip, src_port = key.split('-')[0].rsplit(':', 1)
-        sender_ip = sender_msgs[0].src_ip if sender_msgs else src_ip
+        # The Receiver connects to the Sender's control port, so the session's Sender address
+        # and port are those of this connection, whatever other TCP traffic the capture holds.
+        if sender_msgs:
+            sender_ip, ctrl_port = sender_msgs[0].src_ip, sender_msgs[0].src_port
+        else:
+            sender_ip, ctrl_port = receiver_msgs[0].dst_ip, receiver_msgs[0].dst_port
 
         sess = Session(
             sender_ip=sender_ip,
-            sender_port=sender_port or 0,
+            sender_port=ctrl_port,
             receiver_ip='',
             capture_end=capture_end,
         )
@@ -2423,9 +2429,10 @@ def analyze_pcap(
         for f in sess.findings[first_finding:]:
             f.connection = f.connection or sess.control.label
 
-    # If no control channel found, create a default session.
+    # If no control channel found, create a default session. Its port cannot be read from the
+    # capture, so it carries the caller's *sender_port*, if any.
     if not sessions:
-        sessions.append(Session(sender_ip='', sender_port=0, receiver_ip='',
+        sessions.append(Session(sender_ip='', sender_port=sender_port or 0, receiver_ip='',
                                 capture_end=capture_end))
 
     default_session = sessions[0]
@@ -2802,9 +2809,13 @@ def _print_messages(sess: Session, decode_usb: bool = False) -> None:
 
 
 def _print_session(sess: Session, verbose: bool, show_messages: bool = False,
-                   show_requirements: bool = False, decode_usb: bool = False) -> None:
+                   show_requirements: bool = False, decode_usb: bool = False,
+                   expected_sender_port: Optional[int] = None) -> None:
     print(f"\n{'='*72}")
     print(f"Session: Sender={sess.sender_ip}:{sess.sender_port}")
+    if sess.control.key and expected_sender_port not in (None, sess.sender_port):
+        print(f"  Note: --sender-port {expected_sender_port} was given, but the Sender's control "
+              f"connection uses port {sess.sender_port}")
     if sess.control.sender_info:
         info = sess.control.sender_info
         print(f"  Sender  CID={info.get('cid','?')}  SN='{_printable(str(info.get('sn','?')))}'")
@@ -2971,10 +2982,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="IPMX USB (TR-10-14) Protocol Dissector and Validator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Exit status: 0 PASS, 1 FAIL (an ERROR, or an input that cannot be read), "
+               "2 NOT TESTED (no IPMX USB message in the capture).",
     )
     parser.add_argument('pcap_file', help="PCAP file to analyze")
     parser.add_argument('--sender-port', type=int, default=None,
-                        help="Sender TCP port (default: auto-detect)")
+                        help="Sender TCP port, used only to label data channels whose control "
+                             "connection is not in the capture. A session's port is otherwise "
+                             "read from its control connection, and a different value given "
+                             "here is noted")
     parser.add_argument('--sender-cid', default=None,
                         help="Expected Sender CID as hex string, e.g. 0050C2")
     parser.add_argument('--sender-sn', default=None,
@@ -3058,33 +3074,43 @@ def main() -> int:
         diagnose=args.diagnose,
     )
 
+    # analyze_pcap returns a session even for a capture without a single IPMX USB message:
+    # such a capture tested nothing, which is no PASS.
+    tested = [s for s in sessions if _carries_usb(s)]
+    total_errors   = sum(len([f for f in s.findings if f.severity == Severity.ERROR]) for s in tested)
+    total_warnings = sum(len([f for f in s.findings if f.severity == Severity.WARNING]) for s in tested)
+    total_diags    = sum(len([f for f in s.findings if f.severity == Severity.DIAG]) for s in tested)
+    verdict = (Verdict.FAIL if total_errors else Verdict.NOT_TESTED if not tested else Verdict.PASS)
+
     if not args.quiet:
         framing_warning = _framing_report()
         if framing_warning:
             print(f"\n{framing_warning}")
 
-        for sess in sessions:
+        for sess in tested:
             _print_session(sess, verbose=args.verbose,
                            show_messages=args.messages,
                            show_requirements=args.requirements,
-                           decode_usb=args.decode_usb)
+                           decode_usb=args.decode_usb,
+                           expected_sender_port=args.sender_port)
 
-        total_errors   = sum(len([f for f in s.findings if f.severity == Severity.ERROR]) for s in sessions)
-        total_warnings = sum(len([f for f in s.findings if f.severity == Severity.WARNING]) for s in sessions)
-        total_diags    = sum(len([f for f in s.findings if f.severity == Severity.DIAG]) for s in sessions)
         print(f"\n{'='*72}")
-        print(f"Total: {len(sessions)} session(s), {total_errors} error(s), {total_warnings} warning(s)"
+        print(f"Total: {len(tested)} session(s), {total_errors} error(s), {total_warnings} warning(s)"
               + (f", {total_diags} diag(s)" if args.diagnose or total_diags else ""))
+        if verdict is Verdict.NOT_TESTED:
+            print(f"Result: NOT TESTED: no IPMX USB message in {args.pcap_file}")
+        else:
+            print(f"Result: {verdict.name}")
 
     if args.output:
-        result = _sessions_to_json(sessions)
+        result = _sessions_to_json(tested)
+        result['verdict'] = verdict.name
         with open(args.output, 'w') as fh:
             json.dump(result, fh, indent=2)
         if not args.quiet:
             print(f"Results written to {args.output}")
 
-    total_errors = sum(len([f for f in s.findings if f.severity == Severity.ERROR]) for s in sessions)
-    return 0 if total_errors == 0 else 1
+    return int(verdict)
 
 
 if __name__ == '__main__':
