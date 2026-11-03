@@ -181,31 +181,7 @@ Python scripts are used to verify conformance to TP-1 section 13. For a given fo
    - `IPMX_VENDOR_XYZ\audio-<guid>.sender.caps.json` - Audio Sender Capabilities file
 
 
-#### Running the legacy scripts for each section
-   **Section 13.1 Tests**
-   ```batch
-   python TP-10-1Sec13.1.py cfg\Test*.cfg IPMX_VENDOR_XYZ\video-*.pcap
-   python TP-10-1Sec13.1.py cfg\Test*.cfg IPMX_VENDOR_XYZ\audio-*.pcap
-   ```
-
-   **Section 13.2 Tests**
-   ```batch
-   python TP-10-1Sec13.2.py cfg\Test*.cfg IPMX_VENDOR_XYZ\video-*.sdp
-   python TP-10-1Sec13.2.py cfg\Test*.cfg IPMX_VENDOR_XYZ\audio-*.sdp
-   ```
-
-   **Section 13.3a Tests**
-   ```batch
-   python TP-10-1Sec13.3a.py IPMX_VENDOR_XYZ\video-*.pcap IPMX_VENDOR_XYZ\video-*.sdp
-   python TP-10-1Sec13.3a.py IPMX_VENDOR_XYZ\audio-*.pcap IPMX_VENDOR_XYZ\audio-*.sdp
-   ```
-
-   **Section 13.3b Tests**
-   ```batch
-   python TP-10-1Sec13.3b.py cfg\Test*.cfg IPMX_VENDOR_XYZ\video-*.pcap
-   python TP-10-1Sec13.3b.py cfg\Test*.cfg IPMX_VENDOR_XYZ\audio-*.pcap
-   ```
-#### Running the new scripts for each section
+#### Running the scripts for each section
    **Section 13.1 Tests**
    **Section 13.2 Tests**
    **Section 13.3a Tests**
@@ -475,9 +451,9 @@ These tests verify that your Device Under Test (DuT) correctly implements the NM
         - Test the Senders of the DuT:
 
             - Redo Phase one "For TP-1 sections 13" PCAP and SDP files capture with the DuT Sender configured for the IPMX JPEG XS Profile.
-                - Rerun the legacy or new scripts that validate the PCAP and SDP files and verify the script results and the perform visual inspection.
+                - Rerun the scripts that validate the PCAP and SDP files and verify the script results and the perform visual inspection.
             - Additionally, when testing compliance for the IPMX JPEG XS TDC Profile Mode redo Phase one "For TP-1 sections 13" PCAP and SDP files capture with the DuT Sender configured for the IPMX JPEG XS TDC Profile Mode.
-                - Rerun the legacy or new scripts that validate the PCAP and SDP files using the --tdc command line option, and verify the script results and the perform visual inspection.
+                - Rerun the scripts that validate the PCAP and SDP files using the --tdc command line option, and verify the script results and the perform visual inspection.
 
         - Test the Receivers of the DuT:
 
@@ -555,7 +531,7 @@ These tests verify that your Device Under Test (DuT) correctly implements the NM
     - Test the Senders of the DuT:
 
         - Redo Phase one "For TP-1 sections 13" PCAP and SDP files capture with the DuT Sender configured for the vendor selected IPMX Profile with HKEP enabled.
-            - Rerun the legacy or new scripts along with the --hkep command line option that validate the PCAP and SDP files and verify the script results and the perform visual inspection.
+            - Rerun the scripts along with the --hkep command line option that validate the PCAP and SDP files and verify the script results and the perform visual inspection.
 
     - Test the Receivers of the DuT:
 
@@ -604,7 +580,7 @@ These tests verify that your Device Under Test (DuT) correctly implements the NM
     - Test the Senders of the DuT:
 
         - Redo Phase one "For TP-1 sections 13" PCAP and SDP files capture with the DuT Sender configured for the vendor selected IPMX Profile with PEP enabled.
-            - Rerun the legacy or new scripts along with the --pep command line option that validate the PCAP and SDP files and verify the script results and the perform visual inspection.
+            - Rerun the scripts along with the --pep command line option that validate the PCAP and SDP files and verify the script results and the perform visual inspection.
 
     - Test the Receivers of the DuT:
 
