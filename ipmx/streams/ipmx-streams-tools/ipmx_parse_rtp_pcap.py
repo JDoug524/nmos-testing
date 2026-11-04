@@ -71,56 +71,94 @@ class RtpSequenceAnalysis:
     gaps: list[RtpSeqGap] = field(default_factory=list)
     first_seq: int | None = None
     last_seq: int | None = None
+    wraps: int = 0  # 16-bit sequence-number cycles completed by the highest sequence
 
     @property
     def complete(self) -> bool:
         return self.total_missing == 0
 
     def summary(self) -> str:
-        if self.complete:
+        wraps = f", {self.wraps} wrap(s)" if self.wraps else ""
+        if self.complete and not self.total_duplicates:
             return (
                 f"{self.total_received} packets, no gaps, "
-                f"seq {self.first_seq}..{self.last_seq}"
+                f"seq {self.first_seq}..{self.last_seq}{wraps}"
             )
         return (
             f"{self.total_received} received, {self.total_missing} missing "
             f"({len(self.gaps)} gap(s)), {self.total_duplicates} duplicate(s), "
-            f"seq {self.first_seq}..{self.last_seq}"
+            f"seq {self.first_seq}..{self.last_seq}{wraps}"
         )
 
 
 class RtpSequenceTracker:
-    """Track RTP sequence numbers and detect gaps / duplicates."""
+    """Track RTP sequence numbers and detect gaps / duplicates.
+
+    Sequence numbers are extended across 16-bit wraps as in RFC 3550 §A.1:
+    a packet within half the sequence space ahead of the highest one seen
+    moves it forward (opening a gap if packets were skipped); anything else
+    is a late packet, which fills a gap or is a duplicate.
+    """
 
     def __init__(self) -> None:
-        self._prev_seq: int | None = None
+        self._max_ext: int | None = None
         self._seen: set[int] = set()
+        self._holes: list[tuple[int, int, RtpSeqGap]] = []  # (first_missing_ext, last_missing_ext, gap)
         self._analysis = RtpSequenceAnalysis()
 
+    def _extend(self, seq: int) -> int:
+        """Extended sequence number of *seq* relative to the highest one seen."""
+        assert self._max_ext is not None
+        delta = (seq - self._max_ext) % RTP_SEQ_MOD
+        if delta < RTP_SEQ_MOD // 2:
+            return self._max_ext + delta
+        return self._max_ext - (RTP_SEQ_MOD - delta)
+
+    def _fill_hole(self, ext: int) -> None:
+        for index, (first, last, gap) in enumerate(self._holes):
+            if first <= ext <= last:
+                gap.missing_count -= 1
+                self._analysis.total_missing -= 1
+                if gap.missing_count == 0:
+                    del self._holes[index]
+                    self._analysis.gaps.remove(gap)
+                return
+
     def feed(self, seq: int, capture_time: float | None = None) -> None:
-        self._analysis.total_received += 1
-        if self._analysis.first_seq is None:
-            self._analysis.first_seq = seq
-        self._analysis.last_seq = seq
+        analysis = self._analysis
+        analysis.total_received += 1
+        if analysis.first_seq is None:
+            analysis.first_seq = seq
+        analysis.last_seq = seq
 
-        if seq in self._seen:
-            self._analysis.total_duplicates += 1
-        self._seen.add(seq)
+        if self._max_ext is None:
+            self._max_ext = seq
+            self._seen.add(seq)
+            return
 
-        if self._prev_seq is not None:
-            expected = (self._prev_seq + 1) % RTP_SEQ_MOD
-            if seq != expected:
-                missing = (seq - expected) % RTP_SEQ_MOD
-                if missing > 0 and missing < RTP_SEQ_MOD // 2:
-                    self._analysis.total_missing += missing
-                    self._analysis.gaps.append(RtpSeqGap(
-                        after_seq=self._prev_seq,
-                        expected_seq=expected,
-                        received_seq=seq,
-                        missing_count=missing,
-                        capture_time=capture_time,
-                    ))
-        self._prev_seq = seq
+        ext = self._extend(seq)
+        if ext in self._seen:
+            analysis.total_duplicates += 1
+            return
+        self._seen.add(ext)
+
+        if ext > self._max_ext:
+            missing = ext - self._max_ext - 1
+            if missing:
+                gap = RtpSeqGap(
+                    after_seq=self._max_ext % RTP_SEQ_MOD,
+                    expected_seq=(self._max_ext + 1) % RTP_SEQ_MOD,
+                    received_seq=seq,
+                    missing_count=missing,
+                    capture_time=capture_time,
+                )
+                analysis.total_missing += missing
+                analysis.gaps.append(gap)
+                self._holes.append((self._max_ext + 1, ext - 1, gap))
+            self._max_ext = ext
+            analysis.wraps = ext // RTP_SEQ_MOD  # extension starts at the first raw seq
+        else:
+            self._fill_hole(ext)
 
     @property
     def analysis(self) -> RtpSequenceAnalysis:
