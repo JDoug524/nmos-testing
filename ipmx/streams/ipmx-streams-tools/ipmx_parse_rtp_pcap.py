@@ -1484,6 +1484,12 @@ def record_nalu_metadata(
     context: ParseContext,
     header_bytes: bytes,
 ) -> None:
+    """Record one reconstructed NAL unit.
+
+    *size* is the reconstructed Annex B unit (START_CODE + NAL unit), as
+    written to the elementary stream; ``nal_unit_size`` is the NAL unit
+    alone — what RFC 6184 / RFC 7798 carry and what the Type II HRD counts.
+    """
     context.nalu_counter += 1
     nalus_meta.append(
         {
@@ -1496,6 +1502,7 @@ def record_nalu_metadata(
             "payload_type": packet.payload_type,
             "capture_time": packet.capture_time,
             "nalu_size": size,
+            "nal_unit_size": size - len(START_CODE),
             "stream_offset": offset,
             "header_bytes": [b for b in header_bytes],
         }

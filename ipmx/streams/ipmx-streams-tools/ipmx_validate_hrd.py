@@ -32,6 +32,7 @@ the HSS delivery schedule.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from fractions import Fraction
@@ -373,14 +374,19 @@ _H265_VCL_RANGE = range(0, 32)
 
 
 def compute_au_sizes(report: RtpReport) -> list[AccessUnitSize]:
-    """Compute bit-sizes of each access unit from reconstructed NAL units."""
+    """Compute bit-sizes of each access unit from reconstructed NAL units.
+
+    Sizes are those of the Type II NAL unit stream that RFC 7798 carries
+    (H.265 §C.1: "all bytes of the Type II bitstream, which may be a NAL unit
+    stream or a byte stream"); the start codes added when the elementary
+    stream is rebuilt for FFmpeg are not part of it.
+    """
     vcl_bits_by_ts: dict[int, int] = {}
     all_bits_by_ts: dict[int, int] = {}
 
     for meta in report.nalus_meta:
         ts = int(meta["timestamp"])
-        nalu_size = int(meta.get("nalu_size", 0))
-        bits = nalu_size * 8
+        bits = int(meta["nal_unit_size"]) * 8
         all_bits_by_ts[ts] = all_bits_by_ts.get(ts, 0) + bits
         nal_type = int(meta.get("nal_type", -1))
         if nal_type in _H265_VCL_RANGE:
@@ -691,6 +697,57 @@ _NEAR_OVERFLOW_THRESHOLD = Fraction(99, 100)
 _NEAR_UNDERFLOW_TICKS = 1
 
 
+def cpb_occupancy_before_removals(
+    init_arrivals: list[Fraction],
+    final_arrivals: list[Fraction],
+    removals: list[Fraction],
+    sizes: list[Fraction],
+    bit_rate: Fraction,
+) -> list[Fraction]:
+    """Bits in the CPB just before each unit (AU or DU) is removed.
+
+    H.265 §C.4 item 2: the bits in the CPB are the bits that have arrived
+    minus the bits removed. Unit m arrives at BitRate during
+    [init_arrivals[m], final_arrivals[m]]; units are removed instantaneously
+    in decoding order, so the occupancy peaks just before each removal — and
+    by then later units may already have (partly) arrived: with an initial
+    removal delay of D seconds the CPB holds about D · BitRate bits of
+    upcoming units.
+
+    Arrival intervals are ordered and disjoint (H.265 eq C-3/C-4, H.264 eq
+    C-2/C-3: the initial arrival of a unit is never before the final arrival
+    of the previous one), so every unit before the first one still arriving
+    at time t has fully arrived.
+    """
+    bits_before = [Fraction(0)]
+    for size in sizes:
+        bits_before.append(bits_before[-1] + size)
+
+    occupancies: list[Fraction] = []
+    for n, removal in enumerate(removals):
+        k = bisect_right(final_arrivals, removal)
+        arrived = bits_before[k]
+        if k < len(sizes) and init_arrivals[k] < removal:
+            arrived += (removal - init_arrivals[k]) * bit_rate
+        occupancies.append(arrived - bits_before[n])
+    return occupancies
+
+
+@dataclass(frozen=True)
+class _CpbAuTiming:
+    """Annex C arrival/removal times of one AU, before the occupancy pass."""
+
+    au_index: int
+    rtp_timestamp: int
+    size_in_bits: Fraction
+    init_arrival_time: Fraction
+    final_arrival_time: Fraction
+    nominal_removal_time: Fraction
+    cpb_removal_time: Fraction
+    underflow: bool
+    near_underflow: bool
+
+
 def simulate_cpb(
     hrd: HrdParameters,
     buffering_periods: dict[int, BufferingPeriodInfo],
@@ -718,6 +775,7 @@ def simulate_cpb(
     cbr = hrd.cbr_flag
     low_delay = hrd.low_delay_hrd_flag
 
+    timings: list[_CpbAuTiming] = []
     au_results: list[CpbAuResult] = []
     overflow_count = 0
     underflow_count = 0
@@ -787,13 +845,13 @@ def simulate_cpb(
                 )
             else:
                 # Fallback: advance by one clock tick from previous
-                if au_results:
-                    nominal_removal = au_results[-1].nominal_removal_time + clock_tick
+                if timings:
+                    nominal_removal = timings[-1].nominal_removal_time + clock_tick
                 else:
                     nominal_removal = init_delay / 90000
 
         # --- Initial arrival time (C.2.2) ---
-        if not au_results:
+        if not timings:
             init_arrival = Fraction(0)
         elif cbr:
             init_arrival = prev_final_arrival
@@ -812,83 +870,71 @@ def simulate_cpb(
             ticks_needed = _ceil_fraction(overshoot / clock_tick)
             cpb_removal = nominal_removal + clock_tick * ticks_needed
 
-        # --- CPB occupancy (H.265 Annex C) ---
-        # Bits arrive at BitRate during [init_arrival, final_arrival] for
-        # each AU.  Between AUs no bits arrive (VBR) or bits arrive
-        # continuously (CBR).  We compute the total bits in the CPB just
-        # before removal by summing bits that arrived minus bits removed.
-        #
-        # For AU n, bits_arrived_n = min(cpb_removal - init_arrival_n, final_arrival_n - init_arrival_n) * BitRate
-        # i.e. all bits of AU n have arrived by final_arrival_n; if removal
-        # is after that, all size_bits are in the buffer.
-        if cpb_removal >= final_arrival:
-            bits_of_this_au_in_cpb = size_bits
-        else:
-            bits_of_this_au_in_cpb = bit_rate * (cpb_removal - init_arrival)
-
-        if au_results:
-            prev = au_results[-1]
-            # Bits remaining from previous AUs (after previous removal)
-            # plus any bits that arrived between prev removal and this removal.
-            # In VBR, bits only arrive during scheduled arrival windows.
-            # Since all previous AUs' bits arrived before prev removal
-            # (otherwise prev would have underflowed), the leftover is just
-            # prev.occ_after_removal.  No new bits from old AUs arrive after
-            # their final_arrival.
-            occ_at_removal = prev.cpb_occupancy_after_removal + bits_of_this_au_in_cpb
-        else:
-            occ_at_removal = bits_of_this_au_in_cpb
-
-        occ_after_removal = occ_at_removal - size_bits
-
-        # --- Overflow / underflow checks ---
-        overflow = occ_at_removal > cpb_size
-        underflow = False
-        if not low_delay and nominal_removal < final_arrival:
-            underflow = True
-
-        near_of = occ_at_removal > near_overflow_bits and not overflow
+        # --- Underflow checks (C.4 item 3) ---
+        underflow = not low_delay and nominal_removal < final_arrival
         margin = nominal_removal - final_arrival
         near_uf = (
             not underflow
             and not low_delay
             and Fraction(0) <= margin < clock_tick * _NEAR_UNDERFLOW_TICKS
         )
-
-        if overflow:
-            overflow_count += 1
         if underflow:
             underflow_count += 1
-        if near_of:
-            near_overflow_count += 1
         if near_uf:
             near_underflow_count += 1
-
-        occ_frac = occ_at_removal / cpb_size if cpb_size > 0 else Fraction(0)
-        if occ_frac > max_occ_frac:
-            max_occ_frac = occ_frac
-
         if not underflow:
             if min_underflow_margin is None or margin < min_underflow_margin:
                 min_underflow_margin = margin
 
-        au_results.append(CpbAuResult(
+        timings.append(_CpbAuTiming(
             au_index=n,
             rtp_timestamp=ts,
-            size_in_bits=int(size_bits),
+            size_in_bits=size_bits,
             init_arrival_time=init_arrival,
             final_arrival_time=final_arrival,
             nominal_removal_time=nominal_removal,
             cpb_removal_time=cpb_removal,
-            cpb_occupancy_at_removal=occ_at_removal,
-            cpb_occupancy_after_removal=occ_after_removal,
-            overflow=overflow,
             underflow=underflow,
-            near_overflow=near_of,
             near_underflow=near_uf,
         ))
 
         prev_final_arrival = final_arrival
+
+    # --- CPB occupancy and overflow (C.4 item 2) ---
+    occupancies = cpb_occupancy_before_removals(
+        [t.init_arrival_time for t in timings],
+        [t.final_arrival_time for t in timings],
+        [t.cpb_removal_time for t in timings],
+        [t.size_in_bits for t in timings],
+        bit_rate,
+    )
+    for t, occ_at_removal in zip(timings, occupancies):
+        occ_after_removal = occ_at_removal - t.size_in_bits
+        overflow = occ_at_removal > cpb_size
+        near_of = occ_at_removal > near_overflow_bits and not overflow
+        if overflow:
+            overflow_count += 1
+        if near_of:
+            near_overflow_count += 1
+        occ_frac = occ_at_removal / cpb_size if cpb_size > 0 else Fraction(0)
+        if occ_frac > max_occ_frac:
+            max_occ_frac = occ_frac
+
+        au_results.append(CpbAuResult(
+            au_index=t.au_index,
+            rtp_timestamp=t.rtp_timestamp,
+            size_in_bits=int(t.size_in_bits),
+            init_arrival_time=t.init_arrival_time,
+            final_arrival_time=t.final_arrival_time,
+            nominal_removal_time=t.nominal_removal_time,
+            cpb_removal_time=t.cpb_removal_time,
+            cpb_occupancy_at_removal=occ_at_removal,
+            cpb_occupancy_after_removal=occ_after_removal,
+            overflow=overflow,
+            underflow=t.underflow,
+            near_overflow=near_of,
+            near_underflow=t.near_underflow,
+        ))
 
     skipped = len(au_sizes) - len(au_results)
     valid = overflow_count == 0 and underflow_count == 0
@@ -1083,6 +1129,88 @@ _SIM_CHECK_DESCRIPTIONS: dict[str, str] = {
 # Tier 3: PCAP Timing Cross-Validation (--hrd-timing)
 # ---------------------------------------------------------------------------
 
+HRD_ARRIVAL_TOLERANCE_S = 0.010
+"""Capture-jitter tolerance of HRD-TIME-01 / H264-HRD-TIME-01."""
+
+
+@dataclass(frozen=True)
+class LastByteArrivalCheck:
+    """Last-packet arrival of every simulated AU against its CPB removal time."""
+
+    checked: int
+    late_count: int
+    first_late_ts: int | None
+    min_slack_s: float
+    min_slack_ts: int
+
+
+def check_last_byte_before_removal(
+    au_results: list[CpbAuResult],
+    aus_by_ts: dict[int, AccessUnit],
+    tolerance_s: float = HRD_ARRIVAL_TOLERANCE_S,
+) -> LastByteArrivalCheck | None:
+    """Check that each AU's last packet arrives by its CPB removal time.
+
+    H.265 §C.2.2 / H.264 §C.1.1: the HRD time base starts when the first bit
+    of access unit 0 (the AU whose buffering period SEI initialises the CPB)
+    enters the CPB, initArrivalTime[0] = tai(0) = 0. The capture is mapped
+    onto that time base at AU 0's first packet, then every AU's last packet
+    shall arrive no later than its CPB removal time (``tolerance_s`` absorbs
+    capture jitter). Slack is removal time minus last-packet arrival.
+
+    Returns ``None`` when AU 0 has no capture time.
+    """
+    if not au_results:
+        return None
+    au0 = aus_by_ts.get(au_results[0].rtp_timestamp)
+    if au0 is None or au0.first_packet_time is None:
+        return None
+    capture_at_hrd_zero = au0.first_packet_time - float(au_results[0].init_arrival_time)
+
+    checked = 0
+    late_count = 0
+    first_late_ts: int | None = None
+    min_slack_s = float("inf")
+    min_slack_ts = au_results[0].rtp_timestamp
+    for result in au_results:
+        au = aus_by_ts.get(result.rtp_timestamp)
+        if au is None or au.last_packet_time is None:
+            continue
+        checked += 1
+        slack_s = float(result.cpb_removal_time) - (au.last_packet_time - capture_at_hrd_zero)
+        if slack_s < min_slack_s:
+            min_slack_s = slack_s
+            min_slack_ts = result.rtp_timestamp
+        if slack_s < -tolerance_s:
+            late_count += 1
+            if first_late_ts is None:
+                first_late_ts = result.rtp_timestamp
+    if checked == 0:
+        return None
+    return LastByteArrivalCheck(
+        checked=checked,
+        late_count=late_count,
+        first_late_ts=first_late_ts,
+        min_slack_s=min_slack_s,
+        min_slack_ts=min_slack_ts,
+    )
+
+
+def describe_last_byte_arrival(check: LastByteArrivalCheck) -> tuple[bool, str]:
+    """Pass/fail and detail text shared by HRD-TIME-01 and H264-HRD-TIME-01."""
+    if check.late_count:
+        return False, (
+            f"{check.late_count} of {check.checked} AUs: last packet arrives after the CPB "
+            f"removal time by >{HRD_ARRIVAL_TOLERANCE_S * 1000:.0f}ms (first ts={check.first_late_ts}; "
+            f"worst slack {check.min_slack_s * 1000:.1f}ms at ts={check.min_slack_ts})"
+        )
+    return True, (
+        f"All {check.checked} AUs: last packet arrives before the CPB removal time "
+        f"(min slack {check.min_slack_s * 1000:.1f}ms at ts={check.min_slack_ts}; "
+        f"time base anchored at AU 0 first packet)"
+    )
+
+
 def check_pcap_timing(ctx: ValidationContext) -> list[RequirementResult]:
     """Run Tier 3 PCAP timing cross-validation checks."""
     results: list[RequirementResult] = []
@@ -1126,34 +1254,15 @@ def check_pcap_timing(ctx: ValidationContext) -> list[RequirementResult]:
     aus = ctx.rtp_report.access_units
     aus_by_ts = ctx.rtp_report.access_units_by_ts
 
-    # HRD-TIME-01: AU last-packet arrival vs nominal removal ordering
-    late_arrivals = 0
-    first_late_ts: int | None = None
-    for r in sim.au_results:
-        au = aus_by_ts.get(r.rtp_timestamp)
-        if au is None or au.last_packet_time is None:
-            continue
-        if len(sim.au_results) < 2:
-            continue
-        # Compare relative PCAP times to relative HRD removal times
-        au0 = aus_by_ts.get(sim.au_results[0].rtp_timestamp)
-        if au0 is None or au0.last_packet_time is None:
-            continue
-        pcap_relative = au.last_packet_time - au0.last_packet_time
-        hrd_removal_relative = float(r.cpb_removal_time - sim.au_results[0].cpb_removal_time)
-        if pcap_relative > hrd_removal_relative + 0.010:
-            late_arrivals += 1
-            if first_late_ts is None:
-                first_late_ts = r.rtp_timestamp
-
-    if late_arrivals > 0:
+    # HRD-TIME-01: AU last-packet arrival vs CPB removal time
+    arrival = check_last_byte_before_removal(sim.au_results, aus_by_ts)
+    if arrival is None:
         _add("HRD-TIME-01", "should", False,
-             f"{late_arrivals} AUs where PCAP last-packet time exceeds "
-             f"HRD removal time by >10ms (first ts={first_late_ts})")
+             "No capture time for AU 0 or any simulated AU — cannot anchor the HRD time base",
+             testable=False)
     else:
-        _add("HRD-TIME-01", "should", True,
-             f"PCAP arrival times consistent with HRD removal schedule "
-             f"({len(sim.au_results)} AUs)")
+        passed, detail = describe_last_byte_arrival(arrival)
+        _add("HRD-TIME-01", "should", passed, detail)
 
     # HRD-TIME-02: Actual bit delivery rate vs signalled BitRate
     timed_aus = [au for au in aus if au.first_packet_time is not None]
@@ -1313,7 +1422,8 @@ def check_pcap_timing(ctx: ValidationContext) -> list[RequirementResult]:
 
 
 _TIMING_CHECK_DESCRIPTIONS: dict[str, str] = {
-    "HRD-TIME-01": "PCAP last-packet arrival should not exceed HRD nominal removal time.",
+    "HRD-TIME-01": "PCAP last-packet arrival should not exceed the HRD CPB removal time "
+                   "(time base anchored at AU 0 first packet, H.265 §C.2.2).",
     "HRD-TIME-02": "Actual average bit rate should be consistent with declared BitRate.",
     "HRD-TIME-03": "InitCpbRemovalDelay should be consistent with observed initial buffering.",
     "HRD-TIME-EQC3": "PCAP first-packet times shall be ≥ H.265 §C.2.1.1 eq (C-3) lower bound "

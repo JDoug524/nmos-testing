@@ -58,6 +58,7 @@ from ipmx_validate_hrd import (
     HrdParameters,
     PictureTimingInfo,
     _get_sei_int,
+    cpb_occupancy_before_removals,
     extract_hrd_parameters,
     extract_sei_per_au,
     compute_au_sizes,
@@ -173,7 +174,7 @@ def extract_du_info(
         if du_idx is None or du_delay is None:
             continue
 
-        nalu_size = int(meta.get("nalu_size", 0))
+        nal_unit_size = int(meta["nal_unit_size"])
         au_idx = au_index_by_ts.get(ts, -1)
 
         du = DecodingUnitInfo(
@@ -181,7 +182,7 @@ def extract_du_info(
             du_index_in_au=du_idx,
             rtp_timestamp=ts,
             du_spt_cpb_removal_delay_increment=du_delay,
-            size_in_bits=nalu_size * 8,
+            size_in_bits=nal_unit_size * 8,
             is_last_in_au=False,
         )
         du_map.setdefault(ts, []).append(du)
@@ -217,8 +218,7 @@ def _compute_du_sizes(
     all_bits_by_ts: dict[int, int] = {}
     for meta in report.nalus_meta:
         ts = int(meta["timestamp"])
-        nalu_size = int(meta.get("nalu_size", 0))
-        bits = nalu_size * 8
+        bits = int(meta["nal_unit_size"]) * 8  # Type II NAL unit stream, no start codes
         all_bits_by_ts[ts] = all_bits_by_ts.get(ts, 0) + bits
         nal_type = int(meta.get("nal_type", -1))
         if nal_type in range(0, 32):
@@ -266,6 +266,21 @@ _NEAR_OVERFLOW_THRESHOLD = Fraction(99, 100)
 _NEAR_UNDERFLOW_SUBTICKS = 1
 
 
+@dataclass(frozen=True)
+class _DuTiming:
+    """Annex C arrival/removal times of one DU, before the occupancy pass."""
+
+    du: DecodingUnitInfo
+    rtp_timestamp: int
+    size_in_bits: Fraction
+    init_arrival_time: Fraction
+    final_arrival_time: Fraction
+    nominal_removal_time: Fraction
+    cpb_removal_time: Fraction
+    underflow: bool
+    near_underflow: bool
+
+
 def simulate_cpb_subpic(
     hrd: HrdParameters,
     au_sim: list[CpbAuResult],
@@ -300,6 +315,7 @@ def simulate_cpb_subpic(
         r.rtp_timestamp: r for r in au_sim
     }
 
+    timings: list[_DuTiming] = []
     du_results: list[DuCpbResult] = []
     overflow_count = 0
     underflow_count = 0
@@ -335,7 +351,7 @@ def simulate_cpb_subpic(
                 du_nominal_removal = au_nominal_removal - clock_sub_tick * du_delay_inc
 
             # --- DU initial arrival time (C-3/C-4 with subPicParamsFlag=1) ---
-            if not du_results:
+            if not timings:
                 du_init_arrival = Fraction(0)
             elif cbr:
                 du_init_arrival = prev_du_final_arrival
@@ -354,69 +370,72 @@ def simulate_cpb_subpic(
             else:
                 du_cpb_removal = du_final_arrival
 
-            # --- CPB occupancy ---
-            if du_cpb_removal >= du_final_arrival:
-                bits_in_cpb = size_bits
-            else:
-                bits_in_cpb = bit_rate * (du_cpb_removal - du_init_arrival)
-
-            if du_results:
-                prev = du_results[-1]
-                occ_at_removal = prev.cpb_occupancy_after_removal + bits_in_cpb
-            else:
-                occ_at_removal = bits_in_cpb
-
-            occ_after_removal = occ_at_removal - size_bits
-
-            # --- Overflow / underflow ---
-            overflow = occ_at_removal > cpb_size
-            underflow = False
-            if not low_delay and du_nominal_removal < du_final_arrival:
-                underflow = True
-
-            near_of = occ_at_removal > near_overflow_bits and not overflow
+            # --- Underflow ---
+            underflow = not low_delay and du_nominal_removal < du_final_arrival
             margin = du_nominal_removal - du_final_arrival
             near_uf = (
                 not underflow
                 and not low_delay
                 and Fraction(0) <= margin < clock_sub_tick * _NEAR_UNDERFLOW_SUBTICKS
             )
-
-            if overflow:
-                overflow_count += 1
             if underflow:
                 underflow_count += 1
-            if near_of:
-                near_overflow_count += 1
             if near_uf:
                 near_underflow_count += 1
-
-            occ_frac = occ_at_removal / cpb_size if cpb_size > 0 else Fraction(0)
-            if occ_frac > max_occ_frac:
-                max_occ_frac = occ_frac
-
             if not underflow:
                 if min_underflow_margin is None or margin < min_underflow_margin:
                     min_underflow_margin = margin
 
-            du_results.append(DuCpbResult(
-                au_index=du.au_index,
-                du_index_in_au=du.du_index_in_au,
+            timings.append(_DuTiming(
+                du=du,
                 rtp_timestamp=ts,
-                size_in_bits=du.size_in_bits,
+                size_in_bits=size_bits,
                 init_arrival_time=du_init_arrival,
                 final_arrival_time=du_final_arrival,
                 nominal_removal_time=du_nominal_removal,
                 cpb_removal_time=du_cpb_removal,
-                cpb_occupancy_at_removal=occ_at_removal,
-                cpb_occupancy_after_removal=occ_after_removal,
-                overflow=overflow,
                 underflow=underflow,
-                near_overflow=near_of,
                 near_underflow=near_uf,
             ))
 
             prev_du_final_arrival = du_final_arrival
+
+    # --- CPB occupancy and overflow (C.4 item 2) ---
+    occupancies = cpb_occupancy_before_removals(
+        [t.init_arrival_time for t in timings],
+        [t.final_arrival_time for t in timings],
+        [t.cpb_removal_time for t in timings],
+        [t.size_in_bits for t in timings],
+        bit_rate,
+    )
+    for t, occ_at_removal in zip(timings, occupancies):
+        occ_after_removal = occ_at_removal - t.size_in_bits
+        overflow = occ_at_removal > cpb_size
+        near_of = occ_at_removal > near_overflow_bits and not overflow
+        if overflow:
+            overflow_count += 1
+        if near_of:
+            near_overflow_count += 1
+        occ_frac = occ_at_removal / cpb_size if cpb_size > 0 else Fraction(0)
+        if occ_frac > max_occ_frac:
+            max_occ_frac = occ_frac
+
+        du_results.append(DuCpbResult(
+            au_index=t.du.au_index,
+            du_index_in_au=t.du.du_index_in_au,
+            rtp_timestamp=t.rtp_timestamp,
+            size_in_bits=t.du.size_in_bits,
+            init_arrival_time=t.init_arrival_time,
+            final_arrival_time=t.final_arrival_time,
+            nominal_removal_time=t.nominal_removal_time,
+            cpb_removal_time=t.cpb_removal_time,
+            cpb_occupancy_at_removal=occ_at_removal,
+            cpb_occupancy_after_removal=occ_after_removal,
+            overflow=overflow,
+            underflow=t.underflow,
+            near_overflow=near_of,
+            near_underflow=t.near_underflow,
+        ))
 
     valid = overflow_count == 0 and underflow_count == 0
     parts: list[str] = []

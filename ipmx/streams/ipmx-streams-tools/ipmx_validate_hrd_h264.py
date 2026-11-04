@@ -53,6 +53,8 @@ from ipmx_validate_hrd import (
     CpbSimulationSummary,
     HrdParameters,
     PictureTimingInfo,
+    check_last_byte_before_removal,
+    describe_last_byte_arrival,
     simulate_cpb,
     _get_sei_int,
 )
@@ -248,14 +250,19 @@ def extract_sei_per_au_h264(
 # ---------------------------------------------------------------------------
 
 def compute_au_sizes_h264(report: RtpReport) -> list[AccessUnitSize]:
-    """Compute bit-sizes of each access unit using H.264 VCL NAL types (1-5)."""
+    """Compute bit-sizes of each access unit using H.264 VCL NAL types (1-5).
+
+    Sizes are those of the Type II NAL unit stream that RFC 6184 carries
+    (H.264 §C.1: "all bytes of the Type II bitstream, which may be a NAL unit
+    stream or a byte stream"); the start codes added when the elementary
+    stream is rebuilt for FFmpeg are not part of it.
+    """
     vcl_bits_by_ts: dict[int, int] = {}
     all_bits_by_ts: dict[int, int] = {}
 
     for meta in report.nalus_meta:
         ts = int(meta["timestamp"])
-        nalu_size = int(meta.get("nalu_size", 0))
-        bits = nalu_size * 8
+        bits = int(meta["nal_unit_size"]) * 8
         all_bits_by_ts[ts] = all_bits_by_ts.get(ts, 0) + bits
         nal_type = int(meta.get("nal_type", -1))
         if nal_type in _H264_VCL_RANGE:
@@ -695,7 +702,8 @@ def _check_removal_delay_monotonic_h264(
 # ---------------------------------------------------------------------------
 
 _H264_TIMING_CHECK_DESCRIPTIONS: dict[str, str] = {
-    "H264-HRD-TIME-01": "PCAP last-packet arrival should not exceed HRD nominal removal time.",
+    "H264-HRD-TIME-01": "PCAP last-packet arrival should not exceed the HRD CPB removal time "
+                        "(time base anchored at AU 0 first packet, H.264 §C.1.1).",
     "H264-HRD-TIME-02": "Actual average bit rate should be consistent with declared BitRate.",
     "H264-HRD-TIME-03": "InitCpbRemovalDelay should be consistent with observed initial buffering.",
     "H264-HRD-TIME-EQC3": "PCAP first-packet times shall be ≥ H.264 §C.1.1 eq (C-3) lower bound "
@@ -749,33 +757,15 @@ def check_pcap_timing(ctx: ValidationContext) -> list[RequirementResult]:
     aus = ctx.rtp_report.access_units
     aus_by_ts = ctx.rtp_report.access_units_by_ts
 
-    # H264-HRD-TIME-01: AU last-packet arrival vs nominal removal ordering
-    late_arrivals = 0
-    first_late_ts: int | None = None
-    for r in sim.au_results:
-        au = aus_by_ts.get(r.rtp_timestamp)
-        if au is None or au.last_packet_time is None:
-            continue
-        if len(sim.au_results) < 2:
-            continue
-        au0 = aus_by_ts.get(sim.au_results[0].rtp_timestamp)
-        if au0 is None or au0.last_packet_time is None:
-            continue
-        pcap_relative = au.last_packet_time - au0.last_packet_time
-        hrd_removal_relative = float(r.cpb_removal_time - sim.au_results[0].cpb_removal_time)
-        if pcap_relative > hrd_removal_relative + 0.010:
-            late_arrivals += 1
-            if first_late_ts is None:
-                first_late_ts = r.rtp_timestamp
-
-    if late_arrivals > 0:
+    # H264-HRD-TIME-01: AU last-packet arrival vs CPB removal time
+    arrival = check_last_byte_before_removal(sim.au_results, aus_by_ts)
+    if arrival is None:
         _add("H264-HRD-TIME-01", "should", False,
-             f"{late_arrivals} AUs where PCAP last-packet time exceeds "
-             f"HRD removal time by >10ms (first ts={first_late_ts})")
+             "No capture time for AU 0 or any simulated AU — cannot anchor the HRD time base",
+             testable=False)
     else:
-        _add("H264-HRD-TIME-01", "should", True,
-             f"PCAP arrival times consistent with HRD removal schedule "
-             f"({len(sim.au_results)} AUs)")
+        passed, detail = describe_last_byte_arrival(arrival)
+        _add("H264-HRD-TIME-01", "should", passed, detail)
 
     # H264-HRD-TIME-02: Actual bit delivery rate vs signalled BitRate
     timed_aus = [au for au in aus if au.first_packet_time is not None]
