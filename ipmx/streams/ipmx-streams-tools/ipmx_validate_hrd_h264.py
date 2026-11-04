@@ -434,6 +434,23 @@ def _compute_traced_timestamps_h264(
     return traced_ts, sei_map
 
 
+def trace_coverage(ctx: ValidationContext) -> tuple[int, int] | None:
+    """Return ``(traced, total)`` access-unit counts the HRD checks can judge.
+
+    *total* is the number of AUs in the validation window; *traced* is how
+    many of them the FFmpeg trace covers (``--frames`` limits the trace).
+    Returns ``None`` when no trace is available.
+    """
+    if ctx.timeline is None:
+        return None
+    traced_ts, _ = _compute_traced_timestamps_h264(
+        ctx.rtp_report, ctx.timeline.raw_headers,
+        lossy_timestamps=ctx.timeline.lossy_timestamps)
+    access_units = ctx.rtp_report.access_units
+    traced = sum(1 for au in access_units if au.timestamp in traced_ts)
+    return traced, len(access_units)
+
+
 def _check_bp_presence_h264(ctx: ValidationContext) -> tuple[bool, str]:
     """Check buffering period SEI at every IDR (H.264 NAL type 5)."""
     if ctx.timeline is None:

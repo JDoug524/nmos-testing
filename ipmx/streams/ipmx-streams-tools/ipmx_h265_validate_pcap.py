@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import sys
 from pathlib import Path
 from typing import Any
@@ -352,22 +353,26 @@ def collect_param_sets(report: ValidationContext) -> dict[str, list[bytes]]:
     return {"vps": vps, "sps": sps, "pps": pps}
 
 
-def decode_base64_sets(value: bytes) -> list[bytes]:
+def decode_base64_sets(value: bytes) -> list[bytes] | None:
+    """Decode a MIB 0x0009 sprop-vps/sps/pps value into its NAL units.
+
+    TR-10-15b §16: the MIB carries the base64 characters as represented in
+    the SDP, possibly ','-separated and possibly ','-terminated. Returns
+    ``None`` when *value* is not base64 ASCII text.
+    """
     if not value:
         return []
     try:
         text = value.decode("ascii")
     except UnicodeDecodeError:
-        return [value]
+        return None
     parts = [part.strip() for part in text.split(",") if part.strip()]
-    if not parts:
-        return []
     decoded: list[bytes] = []
     for part in parts:
         try:
             decoded.append(base64.b64decode(part, validate=True))
-        except Exception:
-            return [value]
+        except binascii.Error:
+            return None
     return decoded
 
 
@@ -1364,8 +1369,9 @@ def check_h265_info_matches_stream(ctx: ValidationContext) -> tuple[bool, str]:
 
     1. Extract profile/tier/level from the stream's first SPS and compare
        against the MIB fixed fields (for every field whose mask bit is set).
-    2. If the MIB also carries raw VPS/SPS/PPS, the first occurrence of each
-       in the stream must be byte-identical to the MIB copy.
+    2. If the MIB also carries sprop-vps/sps/pps (base64 text, TR-10-15b §16),
+       each decoded NAL unit must be byte-identical to the first occurrence
+       of that parameter set in the stream.
     """
     if ctx.encrypted:
         return untestable("Payload encrypted — NAL content not accessible")
@@ -1415,7 +1421,7 @@ def check_h265_info_matches_stream(ctx: ValidationContext) -> tuple[bool, str]:
             if mib_val != stream_val:
                 mismatches.append(f"{field} MIB={mib_val} stream={stream_val}")
 
-    # --- Part 2: if MIB carries raw VPS/SPS/PPS, first from stream must be identical ---
+    # --- Part 2: if MIB carries VPS/SPS/PPS, first from stream must be identical ---
     for kind, mib_key in (("vps", "sprop_vps"), ("sps", "sprop_sps"), ("pps", "sprop_pps")):
         bit = H265_INFO_FIELD_BITS[mib_key]
         if not (mask & (1 << bit)):
@@ -1424,6 +1430,11 @@ def check_h265_info_matches_stream(ctx: ValidationContext) -> tuple[bool, str]:
         if not mib_raw:
             continue
         decoded_list = decode_base64_sets(mib_raw)
+        if decoded_list is None:
+            mismatches.append(
+                f"{mib_key}: MIB value is not base64 text (TR-10-15b §16)"
+            )
+            continue
         stream_list = param_sets.get(kind, [])
         if not stream_list:
             mismatches.append(f"{kind}: MIB carries data but stream has none")
@@ -1782,13 +1793,12 @@ def check_mib_vs_sdp_fmtp_h265(ctx: ValidationContext) -> tuple[bool, str]:
         if not mib_raw:
             mismatches.append(f"{mib_field}: MIB empty but SDP has data")
             continue
-        try:
-            sdp_raw = base64.b64decode(sdp_b64)
-        except Exception:
-            mismatches.append(f"{mib_field}: SDP base64 decode failed")
-            continue
+        # TR-10-15b §16: the MIB stores the same base64 ASCII characters
+        # (with optional ',' list separators) as the SDP a=fmtp value, so
+        # the comparison is a byte-for-byte ASCII match.
+        sdp_raw = sdp_b64.encode("ascii")
         if mib_raw != sdp_raw:
-            mismatches.append(f"{mib_field}: MIB and SDP differ")
+            mismatches.append(f"{mib_field}: MIB={mib_raw!r} SDP={sdp_raw!r}")
 
     for mib_field, fmtp_param, sdp_attr in _H265_SDP_STRING_FIELDS:
         bit = H265_INFO_FIELD_BITS[mib_field]
@@ -2191,7 +2201,7 @@ def main() -> int:
     parser.add_argument("--payload-type", type=int, help="Expected RTP payload type")
     parser.add_argument("--ssrc", type=lambda v: int(v, 0), help="Expected SSRC (decimal or 0x hex)")
     parser.add_argument("--dst-ip", dest="dst_ip", help="Expected destination IP address")
-    parser.add_argument("--frames", type=int, default=5, help="Frames to sample with ffmpeg")
+    parser.add_argument("--frames", type=int, default=0, help="Frames to trace with ffmpeg (0 = all, default)")
     parser.add_argument("--max-access-units", type=int, help="Limit access units processed")
     parser.add_argument(
         "--wallclock-backstep-threshold",
@@ -2331,6 +2341,10 @@ def main() -> int:
         print("[INFO] Encryption detected — payload content is not accessible.")
         print("       NAL content checks will be marked as untestable.\n")
     print_first_sr_block_version(ctx.sender_reports)
+    if args.hrd or args.hrd_sim or args.hrd_timing:
+        coverage = ipmx_validate_hrd.trace_coverage(ctx)
+        if coverage is not None:
+            print(f"[INFO] HRD trace coverage: traced {coverage[0]}/{coverage[1]} access units")
     results = run_validation(ctx)
 
     hrd_results = ipmx_validate_hrd.run_hrd_checks(

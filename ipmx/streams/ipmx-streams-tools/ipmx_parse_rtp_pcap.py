@@ -1077,8 +1077,10 @@ def parse_rtp_header(data: bytes) -> tuple[RTPPacket, int] | None:
 
 
 def run_ffmpeg_trace(stream: Path, frames: int) -> str:
+    """Run FFmpeg's trace_headers BSF over *stream*; *frames* <= 0 traces all frames."""
     from ffmpeg_location import find_ffmpeg
     _ffmpeg, _ffmpeg_env = find_ffmpeg()
+    frame_limit = ["-frames:v", str(frames)] if frames > 0 else []
     cmd = [
         _ffmpeg,
         "-hide_banner",
@@ -1086,8 +1088,7 @@ def run_ffmpeg_trace(stream: Path, frames: int) -> str:
         "verbose",
         "-i",
         str(stream),
-        "-frames:v",
-        str(frames),
+        *frame_limit,
         "-c:v",
         "copy",
         "-bsf:v",

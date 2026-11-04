@@ -1596,7 +1596,7 @@ def main() -> int:
     parser.add_argument("--payload-type", type=int, help="Expected RTP payload type")
     parser.add_argument("--ssrc", type=lambda v: int(v, 0), help="Expected SSRC (decimal or 0x hex)")
     parser.add_argument("--dst-ip", dest="dst_ip", help="Expected destination IP address")
-    parser.add_argument("--frames", type=int, default=5, help="Frames to sample with ffmpeg")
+    parser.add_argument("--frames", type=int, default=0, help="Frames to trace with ffmpeg (0 = all, default)")
     parser.add_argument("--max-access-units", type=int, help="Limit access units processed")
     parser.add_argument(
         "--wallclock-backstep-threshold",
@@ -1727,6 +1727,10 @@ def main() -> int:
         print("[INFO] Encryption detected — payload content is not accessible.")
         print("       NAL content checks will be marked as untestable.\n")
     print_first_sr_block_version(ctx.sender_reports)
+    if args.hrd or args.hrd_sim or args.hrd_timing:
+        coverage = ipmx_validate_hrd_h264.trace_coverage(ctx)
+        if coverage is not None:
+            print(f"[INFO] HRD trace coverage: traced {coverage[0]}/{coverage[1]} access units")
     results = run_validation(ctx)
 
     hrd_results = ipmx_validate_hrd_h264.run_hrd_checks(

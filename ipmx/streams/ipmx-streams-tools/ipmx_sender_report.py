@@ -185,12 +185,13 @@ def _variable_bytes(value: object | None) -> bytes:
         return text.encode("ascii")
 
 
-def _h264_param_set_bytes(value: object | None) -> bytes:
-    """Decode an sprop-parameter-sets / sprop-level-parameter-sets value.
+def _sprop_ascii_bytes(value: object | None) -> bytes:
+    """Decode an H.264 sprop-parameter-sets / sprop-level-parameter-sets or
+    H.265 sprop-vps / sprop-sps / sprop-pps value.
 
-    Per TR-10-15c §16, these MIB byte arrays carry the same base64 ASCII
-    characters that appear in the SDP a=fmtp line (with optional ',' list
-    separators). The JSON config holds that ASCII string verbatim.
+    Per TR-10-15c §16 and TR-10-15b §16, these MIB byte arrays carry the same
+    base64 ASCII characters that appear in the SDP a=fmtp line (with optional
+    ',' list separators). The JSON config holds that ASCII string verbatim.
     """
     if value is None:
         return b""
@@ -440,6 +441,17 @@ class H265MediaInfoBlock(IPMXMediaInfoBlock):
         header.extend((total_words - 1).to_bytes(2, "big"))
         return bytes(header + payload)
 
+    def to_dict(self) -> dict[str, object]:
+        # TR-10-15b §16: sprop_vps, sprop_sps and sprop_pps are base64 ASCII
+        # characters as represented in the SDP transport file (with optional
+        # ',' list separators). Keep them human-readable on export rather than
+        # hex-encoding the ASCII bytes.
+        result = super().to_dict()
+        for key in ("sprop_vps", "sprop_sps", "sprop_pps"):
+            val = getattr(self, key)
+            result[key] = val.decode("ascii") if val else ""
+        return result
+
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "H265MediaInfoBlock":
         return cls(
@@ -468,9 +480,9 @@ class H265MediaInfoBlock(IPMXMediaInfoBlock):
             sprop_segmentation_id=_int_or_none(
                 data.get("sprop_segmentation_id")
             ),
-            sprop_vps=_variable_bytes(data.get("sprop_vps")),
-            sprop_sps=_variable_bytes(data.get("sprop_sps")),
-            sprop_pps=_variable_bytes(data.get("sprop_pps")),
+            sprop_vps=_sprop_ascii_bytes(data.get("sprop_vps")),
+            sprop_sps=_sprop_ascii_bytes(data.get("sprop_sps")),
+            sprop_pps=_sprop_ascii_bytes(data.get("sprop_pps")),
             extra_bytes=_variable_bytes(data.get("extra_bytes")),
             media_info_type=int(data.get("media_info_type", 0x0009)),
         )
@@ -580,10 +592,10 @@ class H264MediaInfoBlock(IPMXMediaInfoBlock):
             ),
             sprop_deint_buf_req=_int_or_none(data.get("sprop_deint_buf_req")),
             sprop_init_buf_time=_int_or_none(data.get("sprop_init_buf_time")),
-            sprop_parameter_sets=_h264_param_set_bytes(
+            sprop_parameter_sets=_sprop_ascii_bytes(
                 data.get("sprop_parameter_sets")
             ),
-            sprop_level_parameter_sets=_h264_param_set_bytes(
+            sprop_level_parameter_sets=_sprop_ascii_bytes(
                 data.get("sprop_level_parameter_sets")
             ),
             extra_bytes=_variable_bytes(data.get("extra_bytes")),
