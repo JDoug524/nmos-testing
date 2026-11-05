@@ -839,6 +839,28 @@ def find_slice_only_packets(trace_log: str) -> list[int]:
     return slice_only
 
 
+# Filler data NAL unit type per codec (H.264 Table 7-1: nal_unit_type 12
+# "Filler data"; H.265 Table 7-1: FD_NUT = 38).
+FILLER_DATA_NAL_TYPE = {"h264": 12, "h265": 38}
+
+
+def nal_units_for_trace(report: RtpReport, codec: str) -> list[bytes]:
+    """The windowed NAL units written to the elementary stream that trace_headers parses.
+
+    Filler data NAL units are left out. They carry nothing the trace is used
+    for (the AU sizes of the HRD checks come from nalus_meta), and
+    trace_headers prints one line per filler byte: a CBR stream padded with
+    filler produced ~27.5 MB of trace per frame and ran the validator out of
+    memory. Filler is never a trace header type (H264_SPECIAL /
+    H265_SPECIAL, NAL_TO_HDR_*), so the trace pairing is unaffected.
+    """
+    filler = FILLER_DATA_NAL_TYPE.get(codec)
+    return [
+        nalu for meta, nalu in zip(report.nalus_meta, report.nalus_bytes)
+        if int(meta["nal_type"]) != filler
+    ]
+
+
 def build_timeline(report: RtpReport, codec: str, frames: int) -> TimelineInfo | None:
     if report.encrypted:
         return None
@@ -847,7 +869,8 @@ def build_timeline(report: RtpReport, codec: str, frames: int) -> TimelineInfo |
         find_ffmpeg()
     except SystemExit:
         return None
-    stream_path = write_elementary_stream(report.nalus_bytes, f".{codec[1:]}")
+    traced_nalus = nal_units_for_trace(report, codec)
+    stream_path = write_elementary_stream(traced_nalus, f".{codec[1:]}")
     try:
         trace_log = ipmx_parse_rtp_pcap.run_ffmpeg_trace(stream_path, frames)
     except SystemExit:
@@ -862,7 +885,7 @@ def build_timeline(report: RtpReport, codec: str, frames: int) -> TimelineInfo |
     timeline: list[dict[str, Any]] = []
     try:
         ipmx_parse_rtp_pcap.validate_packet_sizes(
-            packet_sizes, sum(len(n) for n in report.nalus_bytes)
+            packet_sizes, sum(len(n) for n in traced_nalus)
         )
         timeline = ipmx_parse_rtp_pcap.correlate_headers(report_payload, headers)
         header_fields: dict[str, dict[str, Any]] = {}
