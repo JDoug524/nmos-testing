@@ -38,6 +38,8 @@ from ipmx_validate_common import (
     CLOCK_RATE,
     Requirement,
     RequirementResult,
+    RtpReport,
+    TimelineInfo,
     ValidationContext,
     configure_utf8_output,
     build_rtp_report,
@@ -77,6 +79,7 @@ from ipmx_validate_common import (
     extract_video_params_from_sr,
     filter_capture_boundary_orphan_srs,
     apply_recovery_point_window,
+    average_nal_unit_bit_rate,
     print_recovery_window_note,
     get_int_field,
     compute_sr_prefix_length,
@@ -90,13 +93,24 @@ from ipmx_validate_common import (
     resolve_exact_ticks_per_frame,
     run_cmax_hrd_check,
     summarize_results,
+    trace_covered_timestamps,
     untestable,
     unwrap_rtp_timestamps,
+    walk_trace_pairs,
 )
 
 PIXCLK_TOLERANCE_PPM = 100
 
 H264_EXTENSION_NAL_TYPES = {14, 15, 20, 21}
+
+# NAL unit types for which FFmpeg trace_headers emits a block (pairing with
+# nalus_meta, see _build_au_sei_map), and the SEI message fields that
+# identify each message type in that block (libavcodec/cbs_h264 syntax).
+NAL_TO_HDR_H264 = {6: "SEI", 7: "SPS", 8: "PPS"}
+BUFFERING_PERIOD_FIELDS = {"initial_cpb_removal_delay[0]", "initial_cpb_removal_delay"}
+PIC_TIMING_FIELDS = {"cpb_removal_delay", "dpb_output_delay"}
+PIC_STRUCT_FIELD = "pic_struct"
+RECOVERY_POINT_FIELDS = {"recovery_frame_cnt"}
 
 H264_SVC_PROFILES = {83, 86}
 H264_MVC_PROFILES = {118, 128, 134}
@@ -202,11 +216,12 @@ def build_context(args: argparse.Namespace) -> ValidationContext:
         )
         au_ts = {au.timestamp for au in rtp_report.access_units}
         sender_reports = [sr for sr in sender_reports if sr.rtp_timestamp in au_ts]
-    timeline = build_timeline(rtp_report, "h264", args.frames)
-    # Restrict AU-based checks to the cleanly-validatable window (first
-    # recovery point .. last marker-complete AU). Done AFTER build_timeline so
-    # HRD trace correlation still sees the full AU/NAL stream.
+    # Restrict AU- and NAL-based checks to the cleanly-validatable window
+    # (first recovery point .. last marker-complete AU). Done BEFORE
+    # build_timeline: the trace and its SEI/HRD correlation must cover the
+    # same AUs, as trace_headers emits nothing ahead of the first parameter sets.
     apply_recovery_point_window(rtp_report)
+    timeline = build_timeline(rtp_report, "h264", args.frames)
 
     exact_fr: Fraction | None = None
     if getattr(args, "exactframerate", None):
@@ -706,6 +721,121 @@ def check_sps_vs_signal_params(ctx: ValidationContext) -> tuple[bool, str]:
     return True, "SPS signal description matches reference parameters"
 
 
+def _detect_sei_types_from_fields(fields: dict[str, Any]) -> set[str]:
+    """SEI message types present in one trace_headers SEI block.
+
+    A single SEI NAL unit may carry several messages, so each type is
+    identified by its characteristic fields. "pic_struct" is reported when a
+    picture timing message carries pic_struct (pic_struct_present_flag = 1).
+    """
+    keys = set(fields.keys())
+    found: set[str] = set()
+    if keys & BUFFERING_PERIOD_FIELDS:
+        found.add("buffering_period")
+    if keys & PIC_TIMING_FIELDS:
+        found.add("pic_timing")
+        if PIC_STRUCT_FIELD in keys:
+            found.add("pic_struct")
+    if keys & RECOVERY_POINT_FIELDS:
+        found.add("recovery_point")
+    return found
+
+
+def _build_au_sei_map(
+    report: RtpReport,
+    timeline: TimelineInfo,
+) -> tuple[dict[int, set[str]], set[int]]:
+    """Map each AU RTP timestamp to the SEI message types the FFmpeg trace found in it.
+
+    The trace emits headers only for SPS/PPS/SEI NAL units, in elementary
+    stream order; nalus_meta is walked in parallel to correlate each block
+    with its AU. Both cover the recovery-point window
+    (apply_recovery_point_window runs before build_timeline).
+
+    Returns ``(sei_map, traced_timestamps)``; *traced_timestamps* is the set
+    of AU RTP timestamps covered by the trace, with or without SEI
+    (trace_covered_timestamps).
+    """
+    sei_map: dict[int, set[str]] = {}
+    for meta, header in walk_trace_pairs(
+        report, timeline.raw_headers, NAL_TO_HDR_H264, skip_timestamps=timeline.lossy_timestamps
+    ):
+        if header.get("type") != "SEI":
+            continue
+        sei_map.setdefault(int(meta["timestamp"]), set()).update(
+            _detect_sei_types_from_fields(header.get("fields", {})))
+    return sei_map, trace_covered_timestamps(report, timeline)
+
+
+def check_buffering_period_sei(ctx: ValidationContext) -> tuple[bool, str]:
+    """TR-10-15c: "Buffering Period SEI messages shall be provided at each recovery point."
+
+    Recovery points are IDR access units and, for GDR ("The use of GDR
+    (Gradual Decoding Refresh) shall be signaled through the recovery point
+    SEI recovery_frame_cnt attribute"), access units carrying a recovery
+    point SEI.
+    """
+    if ctx.timeline is None:
+        return untestable("FFmpeg trace unavailable")
+    au_sei, traced_ts = _build_au_sei_map(ctx.rtp_report, ctx.timeline)
+    ra_aus = [
+        au for au in ctx.rtp_report.access_units
+        if au.timestamp in traced_ts
+        and (au.recovery_point or "recovery_point" in au_sei.get(au.timestamp, set()))
+    ]
+    if not ra_aus:
+        return untestable("No traced recovery points (IDR or recovery point SEI) detected")
+    missing = [
+        au.timestamp for au in ra_aus
+        if "buffering_period" not in au_sei.get(au.timestamp, set())
+    ]
+    if missing:
+        return False, (
+            f"{len(missing)}/{len(ra_aus)} traced recovery point AUs missing "
+            f"Buffering Period SEI (first missing ts={missing[0]})"
+        )
+    return True, f"Buffering Period SEI present at all {len(ra_aus)} traced recovery points"
+
+
+def check_pic_timing_sei(ctx: ValidationContext) -> tuple[bool, str]:
+    """TR-10-15c: "Picture Timing SEI messages shall be provided for each access
+    unit. The pic_struct() shall be provided in the pic_timing() for interlaced video."
+    """
+    if ctx.timeline is None:
+        return untestable("FFmpeg trace unavailable")
+    au_sei, traced_ts = _build_au_sei_map(ctx.rtp_report, ctx.timeline)
+    traced_aus = [au for au in ctx.rtp_report.access_units if au.timestamp in traced_ts]
+    if not traced_aus:
+        return untestable("No access units covered by trace")
+    missing_pt = [
+        au.timestamp for au in traced_aus
+        if "pic_timing" not in au_sei.get(au.timestamp, set())
+    ]
+    interlaced = _is_interlaced(ctx)
+    missing_ps = [
+        au.timestamp for au in traced_aus
+        if interlaced is True
+        and "pic_timing" in au_sei.get(au.timestamp, set())
+        and "pic_struct" not in au_sei.get(au.timestamp, set())
+    ]
+    issues: list[str] = []
+    if missing_pt:
+        issues.append(
+            f"{len(missing_pt)}/{len(traced_aus)} traced access units missing "
+            f"Picture Timing SEI (first missing ts={missing_pt[0]})"
+        )
+    if missing_ps:
+        issues.append(
+            f"{len(missing_ps)}/{len(traced_aus)} Picture Timing SEI without pic_struct "
+            f"in interlaced video (first ts={missing_ps[0]})"
+        )
+    if issues:
+        return False, "; ".join(issues)
+    scan = {True: "interlaced: pic_struct present", False: "progressive",
+            None: "interlace unknown: pic_struct not checked"}[interlaced]
+    return True, f"Picture Timing SEI present in all {len(traced_aus)} traced access units ({scan})"
+
+
 def check_vui_flags(ctx: ValidationContext) -> tuple[bool, str]:
     if ctx.timeline is None:
         return untestable("FFmpeg trace unavailable")
@@ -903,18 +1033,13 @@ def check_hrd_parameters(ctx: ValidationContext) -> tuple[bool, str]:
         issues.append("declared CpbSize is 0")
 
     HRD_BITRATE_MARGIN = 0.05
-    aus = ctx.rtp_report.access_units
-    if len(aus) >= 2:
-        total_bits = sum(len(n) for n in ctx.rtp_report.nalus_bytes) * 8
-        duration_s = (aus[-1].timestamp - aus[0].timestamp) / CLOCK_RATE
-        if duration_s > 0:
-            actual_avg_bps = total_bits / duration_s
-            if declared_bitrate * (1 + HRD_BITRATE_MARGIN) < actual_avg_bps:
-                issues.append(
-                    f"declared BitRate {declared_bitrate / 1e6:.2f} Mbps "
-                    f"< actual average {actual_avg_bps / 1e6:.2f} Mbps "
-                    f"(>{HRD_BITRATE_MARGIN:.0%} margin exceeded)"
-                )
+    actual_avg_bps = average_nal_unit_bit_rate(ctx.rtp_report)
+    if actual_avg_bps is not None and declared_bitrate * (1 + HRD_BITRATE_MARGIN) < actual_avg_bps:
+        issues.append(
+            f"declared BitRate {declared_bitrate / 1e6:.2f} Mbps "
+            f"< actual average {actual_avg_bps / 1e6:.2f} Mbps "
+            f"(>{HRD_BITRATE_MARGIN:.0%} margin exceeded)"
+        )
 
     init_delay_len = get_int_field(sps, "initial_cpb_removal_delay_length_minus1")
     au_delay_len = get_int_field(sps, "cpb_removal_delay_length_minus1")
@@ -934,11 +1059,8 @@ def check_hrd_parameters(ctx: ValidationContext) -> tuple[bool, str]:
         f"BitRate={declared_bitrate / 1e6:.2f} Mbps, "
         f"CpbSize={declared_cpb_size / 1e6:.2f} Mbit"
     )
-    if len(aus) >= 2:
-        total_bits = sum(len(n) for n in ctx.rtp_report.nalus_bytes) * 8
-        duration_s = (aus[-1].timestamp - aus[0].timestamp) / CLOCK_RATE
-        if duration_s > 0:
-            detail += f", actual avg={total_bits / duration_s / 1e6:.2f} Mbps"
+    if actual_avg_bps is not None:
+        detail += f", actual avg={actual_avg_bps / 1e6:.2f} Mbps"
     return True, detail
 
 
@@ -1341,8 +1463,8 @@ def build_requirements(ctx: ValidationContext) -> list[Requirement]:
     add("TR-10-15c-99", "shall", "H.264 coded video shall be transmitted and decoded using the HRD transmitter and decoder schedules.", lambda _: untestable("HRD presence verified by TR-10-15c-110; schedule conformance not testable from PCAP"))
     add("TR-10-1-MIB-SIG", "shall", "MIB baseband signal parameters shall be internally consistent (htotal >= width, vtotal >= height, pixclk = htotal*vtotal*fps).", lambda c=ctx: check_mib_signal_sanity(c))
     add("TR-10-15c-101", "shall", "Traffic shaping mode shall be set to TP=2110TPW and explicitly declared in the SDP fmtp attribute.", lambda c=ctx: check_sdp_tp_mode_h264(c))
-    add("TR-10-15c-103", "shall", "Buffering Period SEI messages shall be provided at each recovery point.", lambda _: untestable("SEI recovery point details not parsed"))
-    add("TR-10-15c-104", "shall", "Picture Timing SEI messages shall be provided for each access unit; pic_struct shall be provided for interlaced video.", lambda _: untestable("SEI picture timing not parsed"))
+    add("TR-10-15c-103", "shall", "Buffering Period SEI messages shall be provided at each recovery point.", lambda c=ctx: check_buffering_period_sei(c))
+    add("TR-10-15c-104", "shall", "Picture Timing SEI messages shall be provided for each access unit; pic_struct shall be provided for interlaced video.", lambda c=ctx: check_pic_timing_sei(c))
     add("TR-10-15c-105", "shall", "timing_info_present_flag shall equal 1 and num_units_in_tick/time_scale shall match frame rate (time_scale = 2*frame_rate numerator).", lambda c=ctx: check_timing_info(c))
     add("TR-10-15c-106", "shall", "The nominal removal time tr,n(n) shall be an even number for a progressive byte stream.", lambda _: untestable("Nominal removal time not parsed"))
     add("TR-10-15c-107b", "shall", "Decode order shall equal output order.", lambda c=ctx: check_decode_order(c))

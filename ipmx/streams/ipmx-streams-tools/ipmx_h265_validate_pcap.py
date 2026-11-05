@@ -81,6 +81,7 @@ from ipmx_validate_common import (
     extract_video_params_from_sr,
     filter_capture_boundary_orphan_srs,
     apply_recovery_point_window,
+    average_nal_unit_bit_rate,
     print_recovery_window_note,
     get_int_field,
     compute_sr_prefix_length,
@@ -94,6 +95,8 @@ from ipmx_validate_common import (
     resolve_exact_ticks_per_frame,
     run_cmax_hrd_check,
     summarize_results,
+    TimelineInfo,
+    trace_covered_timestamps,
     untestable,
     unwrap_rtp_timestamps,
     walk_trace_pairs,
@@ -158,32 +161,29 @@ def _detect_sei_types_from_fields(fields: dict[str, Any]) -> set[str]:
 
 def _build_au_sei_map(
     report: RtpReport,
-    raw_headers: list[dict[str, Any]],
-    lossy_timestamps: set[int] | None = None,
+    timeline: TimelineInfo,
 ) -> tuple[dict[int, set[str]], set[int]]:
     """Map each AU RTP timestamp to the set of SEI types found by the ffmpeg trace.
 
     The trace emits headers only for VPS/SPS/PPS/SEI NALs, in the same order
     they appear in the elementary stream written from nalus_bytes.  We walk
     nalus_meta in parallel with raw_headers to correlate each trace entry back
-    to its AU timestamp.
+    to its AU timestamp. Both cover the recovery-point window
+    (apply_recovery_point_window runs before build_timeline).
 
     Returns ``(sei_map, traced_timestamps)`` where *traced_timestamps* is the
     set of AU RTP timestamps that were covered by the trace (regardless of
-    whether they contained SEIs).
+    whether they contained SEIs; trace_covered_timestamps).
     """
     sei_map: dict[int, set[str]] = {}
-    traced_ts: set[int] = set()
     for meta, header in walk_trace_pairs(
-        report, raw_headers, NAL_TO_HDR_H265, skip_timestamps=lossy_timestamps
+        report, timeline.raw_headers, NAL_TO_HDR_H265, skip_timestamps=timeline.lossy_timestamps
     ):
-        ts = int(meta["timestamp"])
-        traced_ts.add(ts)
         if header.get("type") != "SEI":
             continue
         sei_types = _detect_sei_types_from_fields(header.get("fields", {}))
-        sei_map.setdefault(ts, set()).update(sei_types)
-    return sei_map, traced_ts
+        sei_map.setdefault(int(meta["timestamp"]), set()).update(sei_types)
+    return sei_map, trace_covered_timestamps(report, timeline)
 
 
 def parse_h265_media_info(payload: bytes) -> dict[str, Any]:
@@ -280,11 +280,12 @@ def build_context(args: argparse.Namespace) -> ValidationContext:
         )
         au_ts = {au.timestamp for au in rtp_report.access_units}
         sender_reports = [sr for sr in sender_reports if sr.rtp_timestamp in au_ts]
-    timeline = build_timeline(rtp_report, "h265", args.frames)
-    # Restrict AU-based checks to the cleanly-validatable window (first
-    # recovery point .. last marker-complete AU). Done AFTER build_timeline so
-    # HRD trace correlation still sees the full AU/NAL stream.
+    # Restrict AU- and NAL-based checks to the cleanly-validatable window
+    # (first recovery point .. last marker-complete AU). Done BEFORE
+    # build_timeline: the trace and its SEI/HRD correlation must cover the
+    # same AUs, as trace_headers emits nothing ahead of the first parameter sets.
     apply_recovery_point_window(rtp_report)
+    timeline = build_timeline(rtp_report, "h265", args.frames)
 
     exact_fr: Fraction | None = None
     if getattr(args, "exactframerate", None):
@@ -739,7 +740,7 @@ def check_buffering_period_sei(ctx: ValidationContext) -> tuple[bool, str]:
     """Buffering Period SEI shall be present at each recovery point (IDR/CRA/BLA)."""
     if ctx.timeline is None:
         return untestable("FFmpeg trace unavailable")
-    au_sei, traced_ts = _build_au_sei_map(ctx.rtp_report, ctx.timeline.raw_headers, lossy_timestamps=ctx.timeline.lossy_timestamps)
+    au_sei, traced_ts = _build_au_sei_map(ctx.rtp_report, ctx.timeline)
     ra_aus = [
         au for au in ctx.rtp_report.access_units
         if any(nal in H265_RA_TYPES for nal in au.nal_types)
@@ -771,7 +772,7 @@ def check_pic_timing_sei(ctx: ValidationContext) -> tuple[bool, str]:
     """Picture Timing SEI shall be present for each access unit."""
     if ctx.timeline is None:
         return untestable("FFmpeg trace unavailable")
-    au_sei, traced_ts = _build_au_sei_map(ctx.rtp_report, ctx.timeline.raw_headers, lossy_timestamps=ctx.timeline.lossy_timestamps)
+    au_sei, traced_ts = _build_au_sei_map(ctx.rtp_report, ctx.timeline)
     traced_aus = [au for au in ctx.rtp_report.access_units if au.timestamp in traced_ts]
     if not traced_aus:
         return untestable("No access units covered by trace")
@@ -826,7 +827,7 @@ def check_sub_pic_hrd(ctx: ValidationContext) -> tuple[bool, str]:
     elif cpb_in_pt != 0:
         issues.append(f"sub_pic_cpb_params_in_pic_timing_sei_flag={cpb_in_pt}, expected 0")
 
-    au_sei, traced_ts = _build_au_sei_map(ctx.rtp_report, ctx.timeline.raw_headers, lossy_timestamps=ctx.timeline.lossy_timestamps)
+    au_sei, traced_ts = _build_au_sei_map(ctx.rtp_report, ctx.timeline)
     traced_aus = [au for au in ctx.rtp_report.access_units if au.timestamp in traced_ts]
     missing_du: list[int] = []
     for au in traced_aus:
@@ -1559,18 +1560,13 @@ def check_hrd_parameters(ctx: ValidationContext) -> tuple[bool, str]:
     top_cpb_size = cpb_sizes[-1] if cpb_sizes[-1] > 0 else (cpb_sizes[0] if cpb_sizes[0] > 0 else 0)
 
     HRD_BITRATE_MARGIN = 0.05
-    aus = ctx.rtp_report.access_units
-    if top_bitrate > 0 and len(aus) >= 2:
-        total_bits = sum(len(n) for n in ctx.rtp_report.nalus_bytes) * 8
-        duration_s = (aus[-1].timestamp - aus[0].timestamp) / CLOCK_RATE
-        if duration_s > 0:
-            actual_avg_bps = total_bits / duration_s
-            if top_bitrate * (1 + HRD_BITRATE_MARGIN) < actual_avg_bps:
-                issues.append(
-                    f"top-layer declared BitRate {top_bitrate / 1e6:.2f} Mbps "
-                    f"< actual average {actual_avg_bps / 1e6:.2f} Mbps "
-                    f"(>{HRD_BITRATE_MARGIN:.0%} margin exceeded)"
-                )
+    actual_avg_bps = average_nal_unit_bit_rate(ctx.rtp_report) if top_bitrate > 0 else None
+    if actual_avg_bps is not None and top_bitrate * (1 + HRD_BITRATE_MARGIN) < actual_avg_bps:
+        issues.append(
+            f"top-layer declared BitRate {top_bitrate / 1e6:.2f} Mbps "
+            f"< actual average {actual_avg_bps / 1e6:.2f} Mbps "
+            f"(>{HRD_BITRATE_MARGIN:.0%} margin exceeded)"
+        )
 
     init_delay_len = get_int_field(sps, "initial_cpb_removal_delay_length_minus1")
     au_delay_len = get_int_field(sps, "au_cpb_removal_delay_length_minus1")
@@ -1598,11 +1594,8 @@ def check_hrd_parameters(ctx: ValidationContext) -> tuple[bool, str]:
             if bitrates[i] > 0 and cpb_sizes[i] > 0
         ]
         detail = f"{max_sub_layers} temporal sub-layers; " + "; ".join(layer_parts)
-    if top_bitrate > 0 and len(aus) >= 2:
-        total_bits = sum(len(n) for n in ctx.rtp_report.nalus_bytes) * 8
-        duration_s = (aus[-1].timestamp - aus[0].timestamp) / CLOCK_RATE
-        if duration_s > 0:
-            detail += f", actual avg={total_bits / duration_s / 1e6:.2f} Mbps"
+    if actual_avg_bps is not None:
+        detail += f", actual avg={actual_avg_bps / 1e6:.2f} Mbps"
     return True, detail
 
 

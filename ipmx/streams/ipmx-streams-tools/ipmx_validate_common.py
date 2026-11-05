@@ -184,8 +184,8 @@ class RtpReport:
     ssrc_set: set[int] = field(default_factory=set)
     encrypted: bool = False
     # Recovery-point capture window (populated by apply_recovery_point_window):
-    # how many boundary AUs were excluded so that all AU-based checks see only
-    # the cleanly-decodable, fully-captured AUs of a mid-stream PCAP.
+    # how many boundary AUs were excluded so that all AU- and NAL-based checks
+    # see only the cleanly-decodable, fully-captured AUs of a mid-stream PCAP.
     dropped_pre_recovery: int = 0      # AUs before the first IRAP/IDR
     dropped_tail_truncated: int = 0    # trailing AUs ending without an RTP marker
     recovery_point_found: bool = True  # False => no IRAP/IDR in capture (head not trimmed)
@@ -199,6 +199,7 @@ class TimelineInfo:
     sampled_frames: int = 0
     trace_warning: str | None = None
     lossy_timestamps: set[int] = field(default_factory=set)
+    trace_packet_count: int = 0  # access units ("Packet:" blocks) trace_headers processed
 
 
 @dataclass
@@ -420,10 +421,14 @@ def apply_recovery_point_window(report: RtpReport) -> RtpReport:
         are NOT dropped — those indicate real loss, surfaced elsewhere.
 
     Mutates and returns ``report``: ``access_units`` is trimmed and re-indexed,
-    ``access_units_by_ts`` is rebuilt, and the drop counts are recorded on the
-    report. Per-packet/NAL lists are left untouched so HRD timeline correlation
-    (which is 1:1 with the full ``nalus_bytes``) stays intact — callers must
-    apply this only AFTER building the timeline.
+    ``access_units_by_ts`` is rebuilt, the drop counts are recorded on the
+    report, and ``nalus_meta`` / ``nalus_bytes`` are restricted to the NAL
+    units of the windowed AUs. Every NAL-level analysis must cover the same
+    AUs as the AU-based checks: FFmpeg ``trace_headers`` emits nothing for the
+    NAL units ahead of the first parameter sets, so pairing a wider NAL list
+    with its output (SEI presence, HRD SEI values, slice-only AUs) shifts
+    every later pairing. Apply this BEFORE ``build_timeline``. ``packets``
+    (one entry per RTP packet) is left untouched for the packet-level checks.
     """
     aus = report.access_units
     if not aus:
@@ -453,7 +458,43 @@ def apply_recovery_point_window(report: RtpReport) -> RtpReport:
         au.index = idx
     report.access_units = windowed
     report.access_units_by_ts = {au.timestamp: au for au in windowed}
+
+    # --- NAL units of the windowed AUs (nalus_meta and nalus_bytes are 1:1) ---
+    if len(report.nalus_meta) != len(report.nalus_bytes):
+        raise ValueError(
+            f"nalus_meta ({len(report.nalus_meta)}) and nalus_bytes "
+            f"({len(report.nalus_bytes)}) are out of step"
+        )
+    kept = [
+        (meta, nalu)
+        for meta, nalu in zip(report.nalus_meta, report.nalus_bytes)
+        if int(meta["timestamp"]) in report.access_units_by_ts
+    ]
+    report.nalus_meta = [meta for meta, _ in kept]
+    report.nalus_bytes = [nalu for _, nalu in kept]
     return report
+
+
+def average_nal_unit_bit_rate(report: RtpReport) -> float | None:
+    """Average bit rate (bit/s) of the access units' Type II NAL unit stream.
+
+    Counts NAL unit bytes (``nal_unit_size``: no start codes, no RTP payload
+    headers; H.264 / H.265 C.1) of the AUs in ``report.access_units`` (the
+    recovery-point window once applied). AUs [0, N-1) are summed over the
+    RTP-timestamp span from AU 0 to AU N-1: N-1 access units over N-1 frame
+    intervals. None with fewer than two AUs or no positive span.
+    """
+    aus = report.access_units
+    if len(aus) < 2:
+        return None
+    span_s = ((aus[-1].timestamp - aus[0].timestamp) & 0xFFFFFFFF) / CLOCK_RATE
+    if span_s <= 0:
+        return None
+    bits_by_ts: dict[int, int] = {}
+    for meta in report.nalus_meta:
+        ts = int(meta["timestamp"])
+        bits_by_ts[ts] = bits_by_ts.get(ts, 0) + int(meta["nal_unit_size"]) * 8
+    return sum(bits_by_ts.get(au.timestamp, 0) for au in aus[:-1]) / span_s
 
 
 def print_recovery_window_note(report: RtpReport) -> None:
@@ -848,7 +889,21 @@ def build_timeline(report: RtpReport, codec: str, frames: int) -> TimelineInfo |
         sampled_frames=frames,
         trace_warning=trace_warning,
         lossy_timestamps=lossy_timestamps,
+        trace_packet_count=len(packet_sizes),
     )
+
+
+def trace_covered_timestamps(report: RtpReport, timeline: TimelineInfo) -> set[int]:
+    """RTP timestamps of the access units the FFmpeg trace covered.
+
+    The elementary stream fed to trace_headers starts at the first AU of the
+    recovery-point window, so its k-th packet is ``report.access_units[k]``;
+    ``--frames`` may stop it early. Lossy (slice-only) AUs are excluded. An AU
+    counts whether or not it carries a NAL unit the trace prints a block for,
+    so the SEI presence checks also see AUs that carry no SEI at all.
+    """
+    covered = report.access_units[:min(timeline.trace_packet_count, len(report.access_units))]
+    return {au.timestamp for au in covered} - timeline.lossy_timestamps
 
 
 def _summarise_trace_errors(trace_log: str) -> str | None:

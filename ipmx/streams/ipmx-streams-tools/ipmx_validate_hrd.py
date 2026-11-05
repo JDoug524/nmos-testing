@@ -42,9 +42,11 @@ from ipmx_validate_common import (
     AccessUnit,
     RequirementResult,
     RtpReport,
+    TimelineInfo,
     ValidationContext,
     get_int_field,
     untestable,
+    trace_covered_timestamps,
     walk_trace_pairs,
 )
 
@@ -563,34 +565,28 @@ _HRD_CHECK_DESCRIPTIONS: dict[str, str] = {
 
 def _compute_traced_timestamps(
     report: RtpReport,
-    raw_headers: list[dict[str, Any]],
-    lossy_timestamps: set[int] | None = None,
+    timeline: TimelineInfo,
 ) -> tuple[set[int], dict[int, set[str]]]:
     """Compute the set of AU timestamps covered by the FFmpeg trace (H.265).
 
-    Pairs each filtered nalus_meta entry with the next raw_headers entry of
-    the matching FFmpeg trace type (VPS=32, SPS=33, PPS=34,
-    SEI_PREFIX=39, SEI_SUFFIX=40). Robust to trace_headers dropping
-    individual blocks for malformed NALs.
-
-    AUs in ``lossy_timestamps`` (slice-only packets where FFmpeg emitted
-    no PPS/SEI/SPS) are skipped from coverage so that subsequent AUs stay
-    aligned with raw_headers.
+    Coverage comes from trace_covered_timestamps: every AU the trace
+    processed, whether or not it carries a NAL unit the trace prints, minus
+    the lossy (slice-only) AUs. The SEI map pairs each filtered nalus_meta
+    entry with the next raw_headers entry of the matching FFmpeg trace type
+    (VPS=32, SPS=33, PPS=34, SEI_PREFIX=39, SEI_SUFFIX=40); lossy AUs are
+    skipped so that subsequent AUs stay aligned with raw_headers.
 
     Returns ``(traced_timestamps, sei_type_map)`` where *sei_type_map*
     maps each AU timestamp to the set of SEI field-name keys found.
     """
-    traced_ts: set[int] = set()
     sei_map: dict[int, set[str]] = {}
     for meta, header in walk_trace_pairs(
-        report, raw_headers, _NAL_TO_HDR_H265, skip_timestamps=lossy_timestamps
+        report, timeline.raw_headers, _NAL_TO_HDR_H265, skip_timestamps=timeline.lossy_timestamps
     ):
-        ts = int(meta["timestamp"])
-        traced_ts.add(ts)
         if header.get("type") == "SEI":
             fields = header.get("fields", {})
-            sei_map.setdefault(ts, set()).update(fields.keys())
-    return traced_ts, sei_map
+            sei_map.setdefault(int(meta["timestamp"]), set()).update(fields.keys())
+    return trace_covered_timestamps(report, timeline), sei_map
 
 
 def trace_coverage(ctx: ValidationContext) -> tuple[int, int] | None:
@@ -602,9 +598,7 @@ def trace_coverage(ctx: ValidationContext) -> tuple[int, int] | None:
     """
     if ctx.timeline is None:
         return None
-    traced_ts, _ = _compute_traced_timestamps(
-        ctx.rtp_report, ctx.timeline.raw_headers,
-        lossy_timestamps=ctx.timeline.lossy_timestamps)
+    traced_ts, _ = _compute_traced_timestamps(ctx.rtp_report, ctx.timeline)
     access_units = ctx.rtp_report.access_units
     traced = sum(1 for au in access_units if au.timestamp in traced_ts)
     return traced, len(access_units)
@@ -614,9 +608,7 @@ def _check_bp_presence(ctx: ValidationContext) -> tuple[bool, str]:
     """Check buffering period SEI at every IRAP."""
     if ctx.timeline is None:
         return False, "FFmpeg trace unavailable"
-    traced_ts, sei_map = _compute_traced_timestamps(
-        ctx.rtp_report, ctx.timeline.raw_headers,
-        lossy_timestamps=ctx.timeline.lossy_timestamps)
+    traced_ts, sei_map = _compute_traced_timestamps(ctx.rtp_report, ctx.timeline)
     h265_ra_types = {16, 17, 18, 19, 20, 21}
     ra_aus = [
         au for au in ctx.rtp_report.access_units
@@ -645,9 +637,7 @@ def _check_pt_presence(ctx: ValidationContext) -> tuple[bool, str]:
     """
     if ctx.timeline is None:
         return False, "FFmpeg trace unavailable"
-    traced_ts, sei_map = _compute_traced_timestamps(
-        ctx.rtp_report, ctx.timeline.raw_headers,
-        lossy_timestamps=ctx.timeline.lossy_timestamps)
+    traced_ts, sei_map = _compute_traced_timestamps(ctx.rtp_report, ctx.timeline)
 
     h265_ra_types = {16, 17, 18, 19, 20, 21}
     first_irap_idx: int | None = None
