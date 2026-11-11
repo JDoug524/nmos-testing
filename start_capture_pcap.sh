@@ -21,6 +21,44 @@ if [ "$IPMX_VENDOR_PCAP_CAPTURE" == "VB440" ]; then
     fi
 fi
 
+# for VIP capture
+if [ "$IPMX_VENDOR_PCAP_CAPTURE" == "VIP" ]; then
+    dest=$(dirname $(realpath "$1"))
+    filename="${1##*/}"
+    sender_id="${filename%.*}"
+    sender_id="${sender_id#*-}"
+    # echo "path  $1"
+    # echo "dest $dest"
+    # echo "filename $filename"
+    # echo "sender_id $sender_id"
+
+    if [ "$4" == "video" ]; then
+        
+        python ./vip_packet_capture_sender_id.py \
+            --ip "$VIP_IP" \
+            --password "$VIP_PASSWORD" \
+            --sender-id "$sender_id" \
+            --port "$VIP_PORT" \
+            --filename "$filename" \
+            --dest "$dest" \
+            --count 30 \
+            --caplen 1500 \
+            --video true
+    fi
+    if [ "$4" == "audio" ]; then
+        python ./vip_packet_capture_sender_id.py \
+            --ip "$VIP_IP" \
+            --password "$VIP_PASSWORD" \
+            --sender-id "$sender_id" \
+            --port "$VIP_PORT" \
+            --filename "$filename" \
+            --dest "$dest" \
+            --count 1000 \
+            --caplen 1500 \
+            --video false
+    fi
+fi
+
 echo "IPMX_VENDOR_PCAP_CAPTURE is $IPMX_VENDOR_PCAP_CAPTURE"
 read -p "Press any key to continue..." -n 1
 echo

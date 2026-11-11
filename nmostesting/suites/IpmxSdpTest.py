@@ -1439,6 +1439,8 @@ class IpmxSdpTest(GenericTest):
             return self.test_101(test)
         elif os.environ.get('IPMX_VENDOR_PCAP_CAPTURE') == 'VB440':
             return self.test_102(test)
+        elif os.environ.get('IPMX_VENDOR_PCAP_CAPTURE') == 'VIP':
+            return self.test_102(test)
         else:
             return test.FAIL("Invalid IPMX_VENDOR_PCAP_CAPTURE environment variable: {}".format(pcap_capture_vendor))
 
