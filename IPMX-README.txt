@@ -146,3 +146,17 @@ Check IPMX_VENDOR_XYZ for the resulting files.
 There are new batch files for the analysis of the IS-11 test results targeting specific environments. The examples provided are IPMX-CHECK-HDMI-IS11s.bat and IPMX-CHECK-HDMI-IS11r.bat. Additional ones can be created for SDI and for scenarios without Input or Outputs.
 
 - This IPMX testing environment is a work-in-progress. Your bug reports and suggestions to make it better are welcome.
+
+- To overlay the GitHub repository on top of the package (Ubuntu commands) firt uncompress the package into the IPMX-testing folder and then execute the following commands:
+    cd IPMX-testing
+	python3.12 -m venv .venv
+	source .venv/bin/activate
+	pip install -r requirements.txt
+	mkdir temp
+	cd temp/
+	git clone https://github.com/alabou/nmos-testing .
+	mv .git/ ..
+	cd ..
+	git checkout -f testing-IPMX
+
+- To update the NMOS-Testing cache. Set nmostesting/Config.py CACHE_IS_READ_ONLY = False and on the next run of an NMOS test the cache will be updated. To prevent further updates restore CACHE_IS_READ_ONLY = True.
