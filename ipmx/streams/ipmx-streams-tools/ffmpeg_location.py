@@ -77,3 +77,35 @@ def find_ffmpeg() -> tuple[str, dict | None]:
     if found:
         return found, None
     raise SystemExit("ffmpeg not found in PATH")
+
+
+# ffmpeg-enhanced build (FFmpeg 8.1 + IPMX). Same FFMPEG_SRC_ROOT convention as
+# ipmx/stream_ipmx.sh; defaults to the sibling usb/ffmpeg-enhanced checkout.
+_ENHANCED_SRC_ROOT_DEFAULT = Path(__file__).resolve().parent.parent / "usb" / "ffmpeg-enhanced"
+
+
+def find_ffmpeg_enhanced() -> tuple[str, dict]:
+    """Return ``(ffmpeg_path, env)`` for the ffmpeg-enhanced build.
+
+    Used for steps that need options only that build provides (e.g. the
+    hevc_metadata ``nal_hrd_bit_rate`` / ``nal_hrd_cpb_size`` options).
+    *env* carries ``LD_LIBRARY_PATH`` for the build's shared libraries.
+
+    Raises ``SystemExit`` when the build is not found.
+    """
+    src_root = Path(os.environ.get("FFMPEG_SRC_ROOT", str(_ENHANCED_SRC_ROOT_DEFAULT)))
+    build_dir = src_root / "src" / "matrox-build"
+    binary = build_dir / "ffmpeg"
+    if not binary.exists():
+        raise SystemExit(
+            f"ffmpeg-enhanced not found at {binary} (set FFMPEG_SRC_ROOT to the checkout)."
+        )
+    lib_dirs = os.pathsep.join(
+        str(build_dir / d)
+        for d in ("libavformat", "libavcodec", "libavutil", "libavfilter",
+                  "libavdevice", "libswscale", "libswresample")
+    )
+    env = os.environ.copy()
+    existing = env.get("LD_LIBRARY_PATH", "")
+    env["LD_LIBRARY_PATH"] = (lib_dirs + os.pathsep + existing) if existing else lib_dirs
+    return str(binary), env

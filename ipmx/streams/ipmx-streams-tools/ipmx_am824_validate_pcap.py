@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -216,7 +217,7 @@ def _build_s337m_scan_results(ctx: Am824ValidationContext) -> list[S337mScanResu
     analysis in build_context so that every check function shares one parse pass.
     """
     blocks = _collect_channel_status_blocks(ctx)
-    if blocks is None:
+    if not isinstance(blocks, list):
         return None
     if _stream_is_pcm(blocks) is not False:
         return None  # PCM or inconsistent — S337M scanning does not apply
@@ -429,25 +430,71 @@ def _find_channel_status_start_index(sequence: list[Any]) -> int | None:
     return None
 
 
+class ChannelStatusUnavailable(Enum):
+    """Why an AES3 channel-status block could not be reconstructed for a sequence."""
+
+    TOO_FEW_FRAMES = f"fewer than {AES3_BLOCK_PERIOD} AES3 frames captured"
+    NO_BLOCK_START = "no Block Start (B=1) found (see ST2110-31-5.4-BLOCKSTART)"
+    INCOMPLETE_BLOCK = f"fewer than {AES3_BLOCK_PERIOD} AES3 frames after the first Block Start (B=1)"
+
+
+@dataclass(frozen=True)
+class ChannelStatusCollection:
+    """Reconstructed AES3 channel-status blocks, one entry per AM824 sequence."""
+
+    blocks: list[tuple[int, bytes]]
+    unavailable: dict[int, ChannelStatusUnavailable]
+
+    def describe_unavailable(self) -> str:
+        by_reason: dict[ChannelStatusUnavailable, list[int]] = {}
+        for index, reason in sorted(self.unavailable.items()):
+            by_reason.setdefault(reason, []).append(index)
+        return "; ".join(
+            f"Channel status not reconstructed for AES3 signal(s) "
+            f"{', '.join(str(s) for s in sorted({i // 2 for i in indices}))} "
+            f"(sequences {', '.join(str(i) for i in indices)}): {reason.value}"
+            for reason, indices in by_reason.items()
+        )
+
+
 def _extract_channel_status_bytes_from_sequence(
     sequences: list[list[Any]],
     sequence_index: int,
-) -> bytes | None:
+) -> bytes | ChannelStatusUnavailable:
+    """Reconstruct the first complete AES3 channel-status block of a sequence.
+
+    The block starts at the Block Start (B=1) subframe of the AES3 signal's
+    subframe-1 sequence; subframe 2 shares its partner's block alignment.
+    """
     sequence = sequences[sequence_index]
     if len(sequence) < AES3_BLOCK_PERIOD:
-        return None
+        return ChannelStatusUnavailable.TOO_FEW_FRAMES
     if sequence_index % 2 == 0:
         start_index = _find_channel_status_start_index(sequence)
     else:
         start_index = _find_channel_status_start_index(sequences[sequence_index - 1])
-    if start_index is None or len(sequence) < start_index + AES3_BLOCK_PERIOD:
-        return None
+    if start_index is None:
+        return ChannelStatusUnavailable.NO_BLOCK_START
+    if len(sequence) < start_index + AES3_BLOCK_PERIOD:
+        return ChannelStatusUnavailable.INCOMPLETE_BLOCK
     block = sequence[start_index : start_index + AES3_BLOCK_PERIOD]
     data = bytearray(24)
     for bit_index, subframe in enumerate(block):
         if subframe.channel_status_bit:
             data[bit_index // 8] |= 1 << (bit_index % 8)
     return bytes(data)
+
+
+def _reconstruct_channel_status(sequences: list[list[Any]]) -> ChannelStatusCollection:
+    blocks: list[tuple[int, bytes]] = []
+    unavailable: dict[int, ChannelStatusUnavailable] = {}
+    for index in range(len(sequences)):
+        result = _extract_channel_status_bytes_from_sequence(sequences, index)
+        if isinstance(result, ChannelStatusUnavailable):
+            unavailable[index] = result
+        else:
+            blocks.append((index, result))
+    return ChannelStatusCollection(blocks=blocks, unavailable=unavailable)
 
 
 def _effective_ptime_set(sample_rate: int | None) -> set[int] | None:
@@ -559,6 +606,73 @@ def check_bf_legality(ctx: Am824ValidationContext) -> tuple[bool, str] | tuple[b
     return True, "All AM824 subframes satisfy B=1 => F=1"
 
 
+def check_block_start_per_signal(ctx: Am824ValidationContext) -> tuple[bool, str] | tuple[bool, str, bool]:
+    """ST 2110-31 §5.4 — every AES3 signal shall flag the first subframe of each AES3 block.
+
+    Block Start (B) "indicates the first subframe of an AES3 Block". When the
+    stream carries several AES3 signals, each signal has its own blocks, so
+    B=1 recurs every AES3_BLOCK_PERIOD frames on subframe 1 of every signal.
+    Blocks of different signals need not be aligned with each other. The
+    frame count assumes a lossless capture, as channel-status reconstruction does.
+    """
+    if ctx.encrypted:
+        return untestable("Payload encrypted — AM824 B bits are not accessible")
+    nchan = ctx.resolved_nchan
+    if nchan is None:
+        return untestable("nchan unresolved — cannot separate AES3 signals")
+    sequences = _extract_sequence_subframes(ctx, nchan)
+    if sequences is None:
+        return False, "Packet payload geometry is incompatible with nchan"
+    failures: list[str] = []
+    short_signals: list[int] = []
+    block_counts: list[str] = []
+    for signal_index in range(nchan // 2):
+        subframe1 = sequences[signal_index * 2]
+        frame_count = len(subframe1)
+        if frame_count < AES3_BLOCK_PERIOD:
+            short_signals.append(signal_index)
+            continue
+        starts = [index for index, subframe in enumerate(subframe1) if subframe.block_start]
+        if not starts:
+            failures.append(f"AES3 signal {signal_index}: no Block Start (B=1) in {frame_count} frames")
+            continue
+        if starts[0] >= AES3_BLOCK_PERIOD:
+            failures.append(
+                f"AES3 signal {signal_index}: first Block Start at frame {starts[0]}, "
+                f"expected within the first {AES3_BLOCK_PERIOD} frames"
+            )
+            continue
+        bad_spacing = [
+            (previous, current) for previous, current in zip(starts, starts[1:])
+            if current - previous != AES3_BLOCK_PERIOD
+        ]
+        if bad_spacing:
+            previous, current = bad_spacing[0]
+            failures.append(
+                f"AES3 signal {signal_index}: Block Starts at frames {previous} and {current} "
+                f"are {current - previous} frames apart, expected {AES3_BLOCK_PERIOD}"
+            )
+            continue
+        if frame_count - starts[-1] > AES3_BLOCK_PERIOD:
+            failures.append(
+                f"AES3 signal {signal_index}: no Block Start after frame {starts[-1]} "
+                f"in the remaining {frame_count - starts[-1] - 1} frames"
+            )
+            continue
+        block_counts.append(f"signal {signal_index}: {len(starts)}")
+    if failures:
+        return False, "; ".join(failures)
+    if short_signals:
+        return untestable(
+            f"Fewer than {AES3_BLOCK_PERIOD} AES3 frames captured for AES3 signal(s) "
+            f"{', '.join(str(s) for s in short_signals)}"
+        )
+    return True, (
+        f"Every AES3 signal flags B=1 every {AES3_BLOCK_PERIOD} frames "
+        f"(blocks per {', '.join(block_counts)})"
+    )
+
+
 def check_parity_bit(ctx: Am824ValidationContext) -> tuple[bool, str] | tuple[bool, str, bool]:
     if ctx.encrypted:
         return untestable("Payload encrypted — AES3 parity bits are not accessible")
@@ -587,10 +701,10 @@ def check_channel_status_standard_impl(ctx: Am824ValidationContext) -> tuple[boo
     sequences = _extract_sequence_subframes(ctx, nchan)
     if sequences is None:
         return False, "Packet payload geometry is incompatible with nchan"
-    for index, _sequence in enumerate(sequences):
-        channel_status = _extract_channel_status_bytes_from_sequence(sequences, index)
-        if channel_status is None:
-            return untestable("Fewer than 192 AES3 frames available for channel-status reconstruction")
+    collection = _reconstruct_channel_status(sequences)
+    if collection.unavailable:
+        return untestable(collection.describe_unavailable())
+    for index, channel_status in collection.blocks:
         non_zero = [byte_index for byte_index, value in enumerate(channel_status) if value != 0]
         if any(byte_index not in {0, 1, 2, 23} for byte_index in non_zero):
             return False, (
@@ -610,10 +724,10 @@ def check_channel_status_modes(ctx: Am824ValidationContext) -> tuple[bool, str] 
     sequences = _extract_sequence_subframes(ctx, nchan)
     if sequences is None:
         return False, "Packet payload geometry is incompatible with nchan"
-    for index, _sequence in enumerate(sequences):
-        channel_status = _extract_channel_status_bytes_from_sequence(sequences, index)
-        if channel_status is None:
-            return untestable("Fewer than 192 AES3 frames available for channel-status reconstruction")
+    collection = _reconstruct_channel_status(sequences)
+    if collection.unavailable:
+        return untestable(collection.describe_unavailable())
+    for index, channel_status in collection.blocks:
         mode = channel_status[1] & 0x0F
         if mode not in AES3_ALLOWED_CHANNEL_MODES:
             return False, (
@@ -632,10 +746,10 @@ def check_channel_status_crc(ctx: Am824ValidationContext) -> tuple[bool, str] | 
     sequences = _extract_sequence_subframes(ctx, nchan)
     if sequences is None:
         return False, "Packet payload geometry is incompatible with nchan"
-    for index, _sequence in enumerate(sequences):
-        channel_status = _extract_channel_status_bytes_from_sequence(sequences, index)
-        if channel_status is None:
-            return untestable("Fewer than 192 AES3 frames available for channel-status reconstruction")
+    collection = _reconstruct_channel_status(sequences)
+    if collection.unavailable:
+        return untestable(collection.describe_unavailable())
+    for index, channel_status in collection.blocks:
         expected_crc = compute_aes3_channel_status_crc(channel_status[:23])
         if channel_status[23] != expected_crc:
             return False, (
@@ -647,20 +761,26 @@ def check_channel_status_crc(ctx: Am824ValidationContext) -> tuple[bool, str] | 
 
 def _collect_channel_status_blocks(
     ctx: Am824ValidationContext,
-) -> list[tuple[int, bytes]] | None:
-    """Return [(sequence_index, channel_status_bytes), ...] for all sequences, or None if geometry fails."""
+) -> list[tuple[int, bytes]] | tuple[bool, str, bool]:
+    """Return [(sequence_index, channel_status_bytes), ...] for every sequence.
+
+    Returns an untestable 3-tuple naming the cause when nchan or the payload
+    geometry is unresolved, or when any sequence's channel status cannot be
+    reconstructed, so no check passes on a partial set of AES3 signals.
+    """
     nchan = ctx.resolved_nchan
     if nchan is None:
-        return None
+        return untestable("nchan unresolved — cannot reconstruct AES3 channel status")
     sequences = _extract_sequence_subframes(ctx, nchan)
     if sequences is None:
-        return None
-    result: list[tuple[int, bytes]] = []
-    for index in range(nchan):
-        cs = _extract_channel_status_bytes_from_sequence(sequences, index)
-        if cs is not None:
-            result.append((index, cs))
-    return result if result else None
+        return untestable(
+            "Payload encrypted or payload geometry incompatible with nchan — "
+            "cannot reconstruct AES3 channel status"
+        )
+    collection = _reconstruct_channel_status(sequences)
+    if collection.unavailable:
+        return untestable(collection.describe_unavailable())
+    return collection.blocks
 
 
 def _stream_is_pcm(blocks: list[tuple[int, bytes]]) -> bool | None:
@@ -683,8 +803,8 @@ def check_channel_status_pcm_flag(ctx: Am824ValidationContext) -> tuple[bool, st
     2k+1) must agree on the audio/non-audio flag.
     """
     blocks = _collect_channel_status_blocks(ctx)
-    if blocks is None:
-        return untestable("nchan unresolved or fewer than 192 AES3 frames available")
+    if not isinstance(blocks, list):
+        return blocks
     pair_mismatches: list[str] = []
     pair_descriptions: list[str] = []
     pairs: dict[int, list[tuple[int, bytes]]] = {}
@@ -711,8 +831,8 @@ def check_channel_status_sample_rate(ctx: Am824ValidationContext) -> tuple[bool,
     if ctx.resolved_sample_rate is None:
         return untestable("sample rate unresolved — cannot cross-check channel-status byte 0 frame-frequency bits")
     blocks = _collect_channel_status_blocks(ctx)
-    if blocks is None:
-        return untestable("nchan unresolved or fewer than 192 AES3 frames available")
+    if not isinstance(blocks, list):
+        return blocks
     expected_bits = aes3_sample_rate_byte0_bits(ctx.resolved_sample_rate)
     for index, cs in blocks:
         actual_bits = cs[0] & 0xC0
@@ -731,8 +851,8 @@ def check_channel_status_sample_rate(ctx: Am824ValidationContext) -> tuple[bool,
 def check_channel_status_pcm_word_length(ctx: Am824ValidationContext) -> tuple[bool, str] | tuple[bool, str, bool]:
     """PCM only — AES3 byte 2 bits 3-5 (word length) must match resolved_sample_size."""
     blocks = _collect_channel_status_blocks(ctx)
-    if blocks is None:
-        return untestable("nchan unresolved or fewer than 192 AES3 frames available")
+    if not isinstance(blocks, list):
+        return blocks
     is_pcm = _stream_is_pcm(blocks)
     if is_pcm is False:
         return untestable("Stream is non-PCM — word-length byte 2 encoding is not defined for PCM")
@@ -758,8 +878,8 @@ def check_channel_status_pcm_word_length(ctx: Am824ValidationContext) -> tuple[b
 def check_channel_status_nonpcm_emphasis(ctx: Am824ValidationContext) -> tuple[bool, str] | tuple[bool, str, bool]:
     """Non-PCM (S337M) only — AES3 byte 0 bits 2-4 shall be 000 (emphasis not indicated, per S337M Table 2)."""
     blocks = _collect_channel_status_blocks(ctx)
-    if blocks is None:
-        return untestable("nchan unresolved or fewer than 192 AES3 frames available")
+    if not isinstance(blocks, list):
+        return blocks
     is_pcm = _stream_is_pcm(blocks)
     if is_pcm is True:
         return untestable("Stream is PCM — S337M emphasis bits do not apply")
@@ -778,8 +898,8 @@ def check_channel_status_nonpcm_emphasis(ctx: Am824ValidationContext) -> tuple[b
 def check_channel_status_nonpcm_channel_mode(ctx: Am824ValidationContext) -> tuple[bool, str] | tuple[bool, str, bool]:
     """Non-PCM (S337M) only — AES3 byte 1 bits 0-3 shall be 0000 (channel mode not indicated, per S337M Table 3)."""
     blocks = _collect_channel_status_blocks(ctx)
-    if blocks is None:
-        return untestable("nchan unresolved or fewer than 192 AES3 frames available")
+    if not isinstance(blocks, list):
+        return blocks
     is_pcm = _stream_is_pcm(blocks)
     if is_pcm is True:
         return untestable("Stream is PCM — S337M channel-mode restriction does not apply")
@@ -798,8 +918,8 @@ def check_channel_status_nonpcm_channel_mode(ctx: Am824ValidationContext) -> tup
 def check_channel_status_nonpcm_byte2_reserved(ctx: Am824ValidationContext) -> tuple[bool, str] | tuple[bool, str, bool]:
     """Non-PCM (S337M) only — AES3 byte 2 bits 6-7 shall be 00 (reserved, per S337M Table 4)."""
     blocks = _collect_channel_status_blocks(ctx)
-    if blocks is None:
-        return untestable("nchan unresolved or fewer than 192 AES3 frames available")
+    if not isinstance(blocks, list):
+        return blocks
     is_pcm = _stream_is_pcm(blocks)
     if is_pcm is True:
         return untestable("Stream is PCM — S337M byte 2 reserved bits do not apply")
@@ -1818,8 +1938,8 @@ def check_s337m_datamode_vs_chstatus(ctx: Am824ValidationContext) -> tuple[bool,
     expected_byte2 = aes3_word_length_byte2(sample_size)
 
     blocks = _collect_channel_status_blocks(ctx)
-    if blocks is None:
-        return untestable("Channel-status blocks not available for cross-check")
+    if not isinstance(blocks, list):
+        return blocks
     for seq_idx, cs in blocks:
         actual_byte2 = cs[2] & 0x3F
         if actual_byte2 != expected_byte2:
@@ -1913,6 +2033,7 @@ def build_requirements() -> list[Requirement]:
     add("ST2110-31-5.4-AM824-WORD", "shall", "RTP payload shall be composed of 32-bit AM824 subframes", check_word_alignment)
     add("ST2110-31-5.4-RESERVED", "shall", "Reserved bits in AM824 words shall be zero", check_reserved_bits)
     add("ST2110-31-5.4-BF", "shall", "AM824 B/F indicators shall be structurally legal", check_bf_legality)
+    add("ST2110-31-5.4-BLOCKSTART", "shall", "Every AES3 signal shall set B=1 on the first subframe of each AES3 block", check_block_start_per_signal)
     add("AES3-4.1.1-P", "shall", "AES3 parity bits shall satisfy even parity", check_parity_bit)
     add("AES3-7.2.2-CHSTATUS", "shall", "AES3 standard implementation over IP shall only use channel-status bytes 0, 1, 2, and 23", check_channel_status_standard_impl)
     add("AES3-7.2.2-CRCC", "shall", "AES3 standard implementation over IP shall carry a valid channel-status CRCC in byte 23", check_channel_status_crc)

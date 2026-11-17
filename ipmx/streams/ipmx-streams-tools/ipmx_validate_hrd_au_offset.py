@@ -453,11 +453,12 @@ def write_analysis_csv(
     for au in report.access_units:
         au_index_by_ts[au.timestamp] = au.index
 
-    # NALU bits per AU (from nalus_meta)
+    # NAL unit bytes per AU (from nalus_meta) — the Type II NAL unit stream
+    # the HRD counts, without the start codes added during reconstruction.
     nalu_bytes_by_ts: dict[int, int] = {}
     for meta in report.nalus_meta:
         ts = int(meta["timestamp"])
-        nalu_bytes_by_ts[ts] = nalu_bytes_by_ts.get(ts, 0) + int(meta.get("nalu_size", 0))
+        nalu_bytes_by_ts[ts] = nalu_bytes_by_ts.get(ts, 0) + int(meta["nal_unit_size"])
 
     # First pass: compute per-AU wire totals and timing
     au_wire_bytes: dict[int, int] = {}

@@ -629,6 +629,7 @@ These tests verify that your Device Under Test (DuT) correctly implements the NM
     ```
     - Results are sorted with FAILED tests printed last
         - The Warning on test_06 about “SHOULD indicate the supported USB class using the ‘urn:x-nmos:cap:transport:usb_class’ parameter constraint” shall not be considered a failure.
+        - The Warning on test_07 about “SHOULD declare urn:x-nmos:cap:transport:usb_class capabilities” shall not be considered a failure.
     - Review output for any failures (some may be expected per test plan)
     - Assess that the keyboard and mouse connected to the reference Sender play back properly, as generated, on the host computer connected to the DuT Receiver.
 
