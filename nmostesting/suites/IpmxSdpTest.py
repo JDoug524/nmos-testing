@@ -1652,8 +1652,10 @@ class IpmxSdpTest(GenericTest):
                     else:
                         capture_script = os.path.join(parent_dir, "start_capture_pcap.sh")
                         pcap_full_path = os.path.join(output_dir, pcap_filename)
+                        linux_interface = MulticastUtils.get_linux_interface_name(interface_name)
+                        print(f"Linux interface is '{linux_interface}' from {interface_name}")
                         # Run through bash explicitly to avoid exec format errors
-                        tcpdump_process = subprocess.Popen(["bash", capture_script, pcap_full_path, multicast_ip, str(port), format])
+                        tcpdump_process = subprocess.Popen(["bash", capture_script, pcap_full_path, multicast_ip, str(port), format, linux_interface])
 
                     print("Started packet capture: {}".format(pcap_filename))
 
