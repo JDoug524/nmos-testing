@@ -18,6 +18,13 @@ set IPMX_RECEIVER_IS05_PORT=
 set IPMX_RECEIVER_IS11_PORT=
 set IPMX_VENDOR=Local
 set IPMX_VENDOR_PCAP_CAPTURE=LOCAL
+REM VB440 capture only: the address of the VB440 probe (host or host:port of its capture API) and
+REM the IDs of the probe's video and audio Receivers to capture from, usually those of one Service.
+REM Set the two IDs to use another Service of the probe, and all three to use another VB440.
+REM A blank value keeps the default of start_capture_pcap.
+set IPMX_VENDOR_PCAP_CAPTURE_VB440_ADDRESS=
+set IPMX_VENDOR_PCAP_CAPTURE_VB440_VIDEO_RECEIVER_ID=
+set IPMX_VENDOR_PCAP_CAPTURE_VB440_AUDIO_RECEIVER_ID=
 
 @echo off
 

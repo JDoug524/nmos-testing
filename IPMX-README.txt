@@ -30,6 +30,11 @@ This folder contains the IPMX NMOS Testing package. Follow these instructions to
         set IPMX_RECEIVER_PORT=IPv4 NMOS Control port of the RECEIVER DuT
         set IPMX_VENDOR=XYZ
         set IPMX_VENDOR_PCAP_CAPTURE=LOCAL or VB440
+        set IPMX_VENDOR_PCAP_CAPTURE_VB440_ADDRESS=IPv4 address, or host:port, of the capture API of the VB440 probe
+        set IPMX_VENDOR_PCAP_CAPTURE_VB440_VIDEO_RECEIVER_ID=ID of the VB440 video Receiver to capture from
+        set IPMX_VENDOR_PCAP_CAPTURE_VB440_AUDIO_RECEIVER_ID=ID of the VB440 audio Receiver to capture from
+
+    The three IPMX_VENDOR_PCAP_CAPTURE_VB440_* variables are used only when IPMX_VENDOR_PCAP_CAPTURE=VB440. A VB440 has one video, one audio and one ancillary Receiver per Service: set the IDs of the video and audio Receivers of the Service to use, and the address of the probe. To use another Service of the same probe, change the two IDs. To use another VB440, set all three, as the Receiver IDs differ from one probe to another. The probe lists its Receivers, with labels naming their Service (e.g. "Service 01, Video 1"), at http://<VB440 address>/x-nmos/node/v1.3/receivers. A blank or undefined variable keeps the default of start_capture_pcap: address 25.30.10.112, video Receiver e64f24f4-e584-5d4a-9d26-0507dde17e65 and audio Receiver ea47ad4c-6c49-5b87-a23c-6ab8391f5b87.
 
     IPMX-SETUP-XYZ.bat
 
@@ -94,15 +99,15 @@ This folder contains the IPMX NMOS Testing package. Follow these instructions to
 - Setup the PCAP capture script start_capture_pcap.bat
 
     Set the path to the dumpcap program. Ex. C:\Program Files\Wireshark\dumpcap
-    Set the IP address of the VB440 probe api. Ex. https://192.168.112.57/probe/api/captures
+    The address of the VB440 probe and the IDs of its Receivers are no longer set in this script: set the IPMX_VENDOR_PCAP_CAPTURE_VB440_* variables in IPMX-SETUP-XYZ.bat (see above).
 
-    You may need to adjust the number of packets captured. By default 6000 for video and 1000 for audio.
+    You may need to adjust the amount captured. By default, LOCAL captures 6000 packets for video and 1000 packets for audio (dumpcap -c), and VB440 captures 30 frames for video (frameLimit) and 1000 packets for audio (packetLimit), with a time limit of 8000 ms for both (timeLimit).
 
     !!! Note that you need to press a key when the message "Press any key to continue..." appears right after displaying "IPMX_VENDOR_PCAP_CAPTURE is ..."
 
     !!! Note that the script now gets the LOCAL interface as a parameter.
 
-    !!! Do not forget to have the VB440 subscrining to the Sender's streams if the VB440 capture mode is used. 
+    !!! Do not forget to have the VB440 Receivers set by IPMX_VENDOR_PCAP_CAPTURE_VB440_VIDEO_RECEIVER_ID and IPMX_VENDOR_PCAP_CAPTURE_VB440_AUDIO_RECEIVER_ID subscribing to the Sender's streams if the VB440 capture mode is used. 
 
 - The following steps, a) un IPMX-SETUP-XYZ.bat, b) Run the IS-04 test suite on your Receiver, c) Run the IS-04 test suite on your Sender, and d) Activate your Sender and capture an SDP transport file and a PCAP, should be performed to make sure your environment is properly setup.
 

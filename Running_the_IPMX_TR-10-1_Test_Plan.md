@@ -28,7 +28,8 @@ If testing a Sender
 	  - Time display format set to "Time as delta from previous packet"
 	  - Lua dissector for IPMX RTCP Sender Reports installed
 	If using the automated script to retreive the SDP and PCAP file
-	- ✅ `start_capture_pcap.bat` is configured with dumpcap path or VB440 API URL
+	- ✅ LOCAL capture: `start_capture_pcap.bat` is configured with the dumpcap path
+	- ✅ VB440 capture: `IPMX-SETUP-XYZ.bat` sets the VB440 probe address and Receiver IDs (`IPMX_VENDOR_PCAP_CAPTURE_VB440_ADDRESS`, `IPMX_VENDOR_PCAP_CAPTURE_VB440_VIDEO_RECEIVER_ID`, `IPMX_VENDOR_PCAP_CAPTURE_VB440_AUDIO_RECEIVER_ID`)
 
 ## Test Execution Overview
 
@@ -62,7 +63,7 @@ This phase assumes an environment with a unicast NMOS Registry server and a full
 
 	If you plan on using the automated script for retrieving the SDP and PCAP file used during these tests; verify the proper configuration of the system as follow.
 
-    - If using the VB440 as the capture tool, have the VB440 subscribe to the audio and/or video streams of the DuT Sender.
+    - If using the VB440 as the capture tool, have the VB440 Receivers set by `IPMX_VENDOR_PCAP_CAPTURE_VB440_VIDEO_RECEIVER_ID` and `IPMX_VENDOR_PCAP_CAPTURE_VB440_AUDIO_RECEIVER_ID` subscribe to the video and/or audio streams of the DuT Sender.
 
 	- Run IPMX-PCAPs.bat and verify the information listed as the capture test executes. The following lines describe the most important information displayed during the capture of the SDP and PCAP files. It is expected that a tool like the VB440 will be used for official IPMX testing but a LOCAL capture is also possible. The test operator must press any key after the capture of each PCAP file: after the video capture and after the audio capture. If using a tools like the VB440, the subscribed Receivers are those of the capture tool.
 
@@ -72,6 +73,7 @@ This phase assumes an environment with a unicast NMOS Registry server and a full
 	  Windows Interfaces ...
 	  Windows NPF is ...
 	  Started packet capture: video-*.pcap
+	  VB440 capture: probe ..., video receiver ...
 	  Capturing on ...
 	  File: IPMX_VENDOR_XYZ\video-*.pcap
 	  Packets captured ...
@@ -89,6 +91,7 @@ This phase assumes an environment with a unicast NMOS Registry server and a full
 	  Windows Interfaces ...
 	  Windows NPF is ...
 	  Started packet capture: audio-*.pcap
+	  VB440 capture: probe ..., audio receiver ...
 	  Capturing on ...
 	  File: IPMX_VENDOR_XYZ\audio-*.pcap
 	  Packets captured ...
@@ -105,7 +108,7 @@ This phase assumes an environment with a unicast NMOS Registry server and a full
 
 	- Verify that the displayed SDP files match with those stored in the IPMX_VENDOR_XYZ directory and correspond to the actual configuration of the video and audio streams.
 
-	- Use Wireshark to open both the video and audio PCAP files and make sure there are a minimum of 10 RTCP IPMX Sender Reports in each PCAP file. If there are not enough RTCP Sender Reports, edit `start_capture_pcap.bat` to increase the `packetLimit` value in the curl command (default is 6000 for video and 1000 for audio) or increase the `-c` parameter for LOCAL capture mode.
+	- Use Wireshark to open both the video and audio PCAP files and make sure there are a minimum of 10 RTCP IPMX Sender Reports in each PCAP file. If there are not enough RTCP Sender Reports, edit `start_capture_pcap.bat` to increase the limits in the curl command for VB440 capture mode (default `frameLimit` 30 frames for video, `packetLimit` 1000 packets for audio, `timeLimit` 8000 ms for both) or the `-c` parameter of dumpcap for LOCAL capture mode (default 6000 packets for video and 1000 for audio).
 
 - You are now ready to proceed with the TP-1 Test Plan.
 

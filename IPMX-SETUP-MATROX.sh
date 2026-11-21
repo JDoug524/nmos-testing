@@ -20,6 +20,13 @@ export IPMX_RECEIVER_IS11_PORT=
 export IPMX_VENDOR=Matrox
 export IPMX_VENDOR_PCAP_CAPTURE=VB440
 #export IPMX_VENDOR_PCAP_CAPTURE=LOCAL
+# VB440 capture only: the address of the VB440 probe (host or host:port of its capture API) and
+# the IDs of the probe's video and audio Receivers to capture from, usually those of one Service.
+# Set the two IDs to use another Service of the probe, and all three to use another VB440.
+# A blank value keeps the default of start_capture_pcap.
+export IPMX_VENDOR_PCAP_CAPTURE_VB440_ADDRESS=25.30.10.112
+export IPMX_VENDOR_PCAP_CAPTURE_VB440_VIDEO_RECEIVER_ID=e64f24f4-e584-5d4a-9d26-0507dde17e65
+export IPMX_VENDOR_PCAP_CAPTURE_VB440_AUDIO_RECEIVER_ID=ea47ad4c-6c49-5b87-a23c-6ab8391f5b87
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
