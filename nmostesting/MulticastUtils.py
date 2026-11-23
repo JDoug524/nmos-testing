@@ -260,6 +260,17 @@ class MulticastUtils:
         return None
 
     @staticmethod
+    def get_linux_interface_name(interface_ip: str) -> Optional[str]:
+        """
+        Get the name of the Linux interface that holds an IPv4 address, as dumpcap -i expects it
+        """
+        for name, addrs in psutil.net_if_addrs().items():
+            for addr in addrs:
+                if addr.family == socket.AF_INET and addr.address == interface_ip:
+                    return name
+        return None
+
+    @staticmethod
     def get_windows_interface_NPF(interface_name: str) -> Optional[str]:
         """
         Get NPF device path for a Windows interface name or IP address.

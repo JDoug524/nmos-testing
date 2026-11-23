@@ -19,6 +19,13 @@ export IPMX_RECEIVER_IS05_PORT=
 export IPMX_RECEIVER_IS11_PORT=
 export IPMX_VENDOR=Local
 export IPMX_VENDOR_PCAP_CAPTURE=LOCAL
+# VB440 capture only: the address of the VB440 probe (host or host:port of its capture API) and
+# the IDs of the probe's video and audio Receivers to capture from, usually those of one Service.
+# Set the two IDs to use another Service of the probe, and all three to use another VB440.
+# A blank value keeps the default of start_capture_pcap.
+export IPMX_VENDOR_PCAP_CAPTURE_VB440_ADDRESS=
+export IPMX_VENDOR_PCAP_CAPTURE_VB440_VIDEO_RECEIVER_ID=
+export IPMX_VENDOR_PCAP_CAPTURE_VB440_AUDIO_RECEIVER_ID=
 
 if [ -z "$IPMX_SENDER_IS05_ADDRESS" ]; then
     export IPMX_SENDER_IS05_ADDRESS=$IPMX_SENDER_ADDRESS
