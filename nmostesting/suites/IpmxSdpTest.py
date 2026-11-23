@@ -1429,7 +1429,7 @@ class IpmxSdpTest(GenericTest):
     def test_100(self, test):
         """
         Pre-Test to get a PCAP capture of a video sender along with its SDP transport file. The selection
-        between the LOCAL or VB440 mode is based on an IPMX_VENDOR_PCAP_CAPTURE environment variable.
+        between the LOCAL, VB440 or VIP mode is based on an IPMX_VENDOR_PCAP_CAPTURE environment variable.
         """
         self.test = test
         

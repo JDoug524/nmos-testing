@@ -28,7 +28,7 @@ If testing a Sender
 	  - Time display format set to "Time as delta from previous packet"
 	  - Lua dissector for IPMX RTCP Sender Reports installed
 	If using the automated script to retreive the SDP and PCAP file
-	- ✅ `start_capture_pcap.bat` is configured with dumpcap path or VB440 API URL
+	- ✅ `start_capture_pcap.bat` is configured with dumpcap path, VB440 API URL or VIP script.
 
 ## Test Execution Overview
 
@@ -64,7 +64,101 @@ This phase assumes an environment with a unicast NMOS Registry server and a full
 
     - If using the VB440 as the capture tool, have the VB440 subscribe to the audio and/or video streams of the DuT Sender.
 
-	- Run IPMX-PCAPs.bat and verify the information listed as the capture test executes. The following lines describe the most important information displayed during the capture of the SDP and PCAP files. It is expected that a tool like the VB440 will be used for official IPMX testing but a LOCAL capture is also possible. The test operator must press any key after the capture of each PCAP file: after the video capture and after the audio capture. If using a tools like the VB440, the subscribed Receivers are those of the capture tool.
+    - If using the VIP as the capture tool, have the VIP subscribe to the one or more senders using NMOS. 
+
+    Using the PacketStorm VIP for Packet Capture
+
+    The PacketStorm VIP can capture video and audio streams for the Section 13 tests. Captures include RTP media packets and RTCP Sender Reports.
+
+    Prepare the VIP
+
+    Connect the VIP to the media network and confirm that its management interface is reachable from the computer running the test package.
+
+    Before starting the capture test, use an NMOS controller to connect the video and audio Senders under test to the appropriate VIP Receivers. Verify that the VIP is receiving the streams.
+
+    Confirm that the sender GUIDs in the test package’s ipmx-test-senders.guid file identify the Senders connected to the VIP.
+
+    Confirm that no other VIP packet capture is running.
+
+    Configure the Test Package
+
+    Follow the PacketStorm VIP setup instructions in IPMX-README.txt.
+
+    Select VIP as the capture device and configure:
+
+    VIP management IP address.
+
+    VIP admin password.
+
+    VIP capture port: A or B.
+
+    Video frame count and audio packet count.
+
+    Packet capture length.
+
+    The sender GUID is supplied automatically by the integrated test workflow.
+
+    Select the Capture Length
+
+    Capture enough traffic for the requirements being evaluated. For tests requiring a two-second measurement window, capture approximately three seconds or longer.
+
+    Examples:
+
+    Video Stream
+    60 fps video
+    Capture setting
+    --count 180 --video true
+    Approximate duration
+    3 seconds
+
+    Video Stream
+    50 fps video
+    Capture setting
+    --count 150 --video true
+    Approximate duration
+    3 seconds
+
+    Audio Stream with 1 ms packet time
+    Capture setting
+    --count 3500 --video false
+    Approximate duration
+    Approximately 3 seconds, including RTCP
+
+    With --video true, the count specifies complete video frames. With --video false, it specifies packets. Shorter audio packet times require larger packet counts.
+
+    Verify the actual duration in the resulting capture.
+
+    Run the Capture
+
+    With the test package’s Python environment activated and the vendor setup settings loaded, run the appropriate command from the main package folder.
+
+    Windows:
+
+    IPMX-PCAPs.bat
+
+    Linux/WSL:
+
+    ./IPMX-PCAPs.sh
+
+    The integrated workflow invokes vip_packet_capture_sender_id.py for each selected Sender and saves the downloaded capture in the output directory selected by the test package, normally IPMX_VENDOR_<vendor>.
+
+    Verify the Captured Files
+
+    Before running the Section 13 analysis:
+
+    Confirm that capture and download completed successfully.
+
+    Confirm that each capture contains the intended media stream and its RTCP Sender Reports.
+
+    Confirm that the capture duration and number of Sender Reports are sufficient for the tests being performed.
+
+    Confirm that the matching SDP describes the stream configuration used during capture.
+
+    Run the appropriate video or audio validator with the capture, matching SDP, and test configuration. Review all individual results, including FAIL and CANNOT_TEST; successful capture does not establish that the stream passes the tests.
+
+    If the VIP reports that a packet capture is already running, allow it to finish or stop it before starting another.
+
+	- Run IPMX-PCAPs.bat and verify the information listed as the capture test executes. The following lines describe the most important information displayed during the capture of the SDP and PCAP files. It is expected that a tool like the VB440 or VIP will be used for official IPMX testing but a LOCAL capture is also possible. The test operator must press any key after the capture of each PCAP file: after the video capture and after the audio capture. If using a tools like the VB440 or VIP, the subscribed Receivers are those of the capture tool.
 
 	  ```
 	  Joining multicast group for sender ...
@@ -79,7 +173,9 @@ This phase assumes an environment with a unicast NMOS Registry server and a full
 	  IPMX_VENDOR_PCAP_CAPTURE is VB440
 	  **Press any key to continue...**
 	  Stopped packet capture: video-*.pcap
-
+      IPMX_VENDOR_PCAP_CAPTURE is VIP
+	  **Press any key to continue...**
+	  Stopped packet capture: video-*.pcap
 	  video SDP transport file displayed here ...
 
 	  Left multicast group ...
@@ -95,7 +191,8 @@ This phase assumes an environment with a unicast NMOS Registry server and a full
 	  Packets received/dropped on interface ...
 	  IPMX_VENDOR_PCAP_CAPTURE is VB440
 	  **Press any key to continue...**
-
+      IPMX_VENDOR_PCAP_CAPTURE is VIP
+	  **Press any key to continue...**
 	  Stopped packet capture: audio-*.pcap
 
 	  audio SDP transport file displayed here ...
@@ -142,7 +239,7 @@ Follow the manual tests described in TP-1 sections 12.4
 
 For TP-1 sections 13
 
-Python scripts are used to verify conformance to TP-1 section 13. For a given format described in a cfg file the SDP file is retrieved from the Sender. A PCAP file of the stream from the Sender is then analyzed and compared to the SDP file and cfg file to test conformance. There is a automated script IPMX-PCAPs.bat that retrieves the SDP file and captures a PCAP file automatically. It does this using either the network card of the computer used to run the test script or a VB440 device. The steps are described further down. Alternatively the retrieval of the SDP file and capture of the PCAP file can be done manually.
+Python scripts are used to verify conformance to TP-1 section 13. For a given format described in a cfg file the SDP file is retrieved from the Sender. A PCAP file of the stream from the Sender is then analyzed and compared to the SDP file and cfg file to test conformance. There is a automated script IPMX-PCAPs.bat or IPMX-PCAPs.sh that retrieves the SDP file and captures a PCAP file automatically. It does this using either the network card of the computer used to run the test script, a VB440 device or a VIP device. The steps are described further down. Alternatively the retrieval of the SDP file and capture of the PCAP file can be done manually.
 
    #### Manual Capture
    The test scripts for section 13 rely on the PCAP capture corresponding to the moment the stream is first activated. When doing the acquisition of the PCAP file manually the suggested methodology is:
